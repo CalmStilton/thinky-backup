@@ -1,0 +1,8 @@
+restic
+rclone
+supercronic
+mariadb
+mariadb-client
+postgresql17-client
+tzdata
+ca-certificates
