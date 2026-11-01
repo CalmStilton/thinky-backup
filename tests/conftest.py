@@ -49,3 +49,4 @@ def snapshot_count(restic, env_overrides=None):
     out = restic.run("snapshots", "--json", capture=True, env_overrides=env_overrides)
     assert out.returncode == 0, out.stderr
     return len(json.loads(out.stdout))
+from restore_support import mapfile, script, world  # noqa: F401  (fixtures for the thinky-restore tests)

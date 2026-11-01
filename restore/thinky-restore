@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# thinky-restore: guided restores from thinky-backup restic repositories.
+# It knows the snapshot layout (/src/opt, /src/vol, /scratch/sqlite), not any one site.
+# Secrets are read with `read -s` or taken from the environment. They go on only as
+# environment variables (docker -e NAME). They are never put on a command line,
+# written to disk or printed.
+set -uo pipefail
+case $- in *x*) echo "ERROR: refusing to run with xtrace on (it would print secrets)" >&2; exit 2 ;; esac
+
+TR_ROOT=${TR_ROOT:-}                       # prefix for every live path; empty on a real machine
+TR_STAGE_ROOT=${TR_STAGE_ROOT:-}           # where restored files are staged (local and image backends)
+TR_IMAGE=${THINKY_RESTORE_IMAGE:-ghcr.io/calmstilton/thinky-backup:latest}
+TR_FORCED_BACKEND=${TR_BACKEND:-}
+TR_FORCED_CONTAINER=
+TR_BACKEND=
+TR_CONTAINER=
+TR_HOST=
+TR_SNAP=
+TR_APP=
+TR_DB=
+TR_FILTER=
+TR_INTO=
+TR_KIND=
+TR_MAPFILE=${THINKY_RESTORE_MAP:-}
+TR_ALL=0
+TR_ASSUME_YES=0
+TR_DRY_RUN=0
+TR_SCRATCH=0
+TR_INTERACTIVE=0
+TR_STAGE_HOST=
+TR_STAGE_ARG=
+TR_STAGE_MOUNT=/restore
+TR_CRED_KIND=
+TR_SNAP_ID=
+TR_SNAP_WHEN=
+TR_LAST_ASIDE=
+TR_SCRATCH_CTR=
+TR_CLEANUP_DIRS=()
+TR_STOPPED=()
+TR_ASIDE_LIST=()
+TR_MAP_SRC=()
+TR_MAP_DST=()
+TR_DOCKER_ENV=()
+
+# ---- output and prompts -------------------------------------------------------
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  tr_abort_cleanup
+  exit 1
+}
+
+ask() {  # ask VAR "prompt" [default]   (the odd local names keep it from shadowing the caller's variable)
+  local __v=$1 __p=$2 __d=${3-} __a=''
+  if [ -n "$__d" ]; then printf '%s [%s]: ' "$__p" "$__d" >&2; else printf '%s: ' "$__p" >&2; fi
+  IFS= read -r __a || __a=''
+  printf -v "$__v" '%s' "${__a:-$__d}"
+}
+
+ask_secret() {  # ask_secret VAR "prompt" : keeps a value already in the environment; never echoes
+  local __v=$1 __p=$2 __a=''
+  if [ -n "${!__v:-}" ]; then export "${__v?}"; return 0; fi
+  printf '%s: ' "$__p" >&2
+  IFS= read -rs __a || __a=''
+  printf '\n' >&2
+  [ -n "$__a" ] || die "no value entered for: $__p"
+  printf -v "$__v" '%s' "$__a"
+  export "${__v?}"
+}
+
+confirm() {  # confirm "question" : true only if the user types exactly: yes
+  local q=$1 ans=
+  if [ "$TR_ASSUME_YES" = 1 ]; then say "$q yes (--yes)"; return 0; fi
+  printf '%s Type yes to continue: ' "$q" >&2
+  IFS= read -r ans || return 1
+  [ "$ans" = yes ]
+}
+
+tr_need() {  # tr_need VAR "prompt" : in the menu ask for a missing value, otherwise stop
+  local v=$1
+  [ -n "${!v}" ] && return 0
+  [ "$TR_INTERACTIVE" = 1 ] || die "missing option: ${v#TR_} (see --help)"
+  ask "$v" "$2"
+  [ -n "${!v}" ] || die "nothing entered"
+}
+
+tr_choose() {  # tr_choose VAR "prompt" ITEM... : numbered list; a number or the item text is accepted
+  local v=$1 p=$2 it ans='' i=1 n
+  shift 2
+  n=$#
+  [ "$n" -gt 0 ] || die "nothing to choose from"
+  for it in "$@"; do printf '  %d) %s\n' "$i" "$it" >&2; i=$((i + 1)); done
+  ask ans "$p" "${TR_CHOOSE_DEFAULT:-}"
+  if [[ $ans =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+    printf -v "$v" '%s' "${!ans}"
+  else
+    printf -v "$v" '%s' "$ans"
+  fi
+}
+
+# ---- cleanup --------------------------------------------------------------------
+tr_cleanup_stage() {
+  local d
+  for d in ${TR_CLEANUP_DIRS[@]+"${TR_CLEANUP_DIRS[@]}"}; do rm -rf -- "$d"; done
+  TR_CLEANUP_DIRS=()
+  TR_STAGE_HOST=
+  if [ -n "$TR_SCRATCH_CTR" ] && command -v docker >/dev/null 2>&1; then
+    docker rm -f "$TR_SCRATCH_CTR" >/dev/null 2>&1
+    TR_SCRATCH_CTR=
+  fi
+}
+
+tr_abort_cleanup() {  # on an error: restart what we stopped only if nothing was replaced yet
+  if [ "${#TR_STOPPED[@]}" -gt 0 ]; then
+    if [ "${#TR_ASIDE_LIST[@]}" -eq 0 ]; then
+      say "Starting the containers that were stopped: ${TR_STOPPED[*]}" >&2
+      docker start "${TR_STOPPED[@]}" >/dev/null 2>&1
+    else
+      warn "stopped containers were left stopped: ${TR_STOPPED[*]}. Something was already replaced; the old copy is kept next to it as *.before-restore-*."
+    fi
+  fi
+  tr_cleanup_stage
+}
+
+tr_unset_creds() {
+  unset RESTIC_REPOSITORY RESTIC_PASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+    RCLONE_CONFIG_GDRIVE_TYPE RCLONE_CONFIG_GDRIVE_SCOPE RCLONE_CONFIG_GDRIVE_CLIENT_ID \
+    RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
+}
+
+tr_on_exit() { tr_cleanup_stage; tr_unset_creds; }
+trap tr_on_exit EXIT
+
+tr_need_root() {  # restores write to /opt, docker volumes and containers: they need root
+  if [ "$(id -u)" -ne 0 ] && [ -z "$TR_ROOT" ]; then die "run this with sudo, for example: sudo bash thinky-restore"; fi
+}
+
+tr_usage() {
+  cat <<'EOF'
+thinky-restore: bring things back from the Thinky backups.
+
+Run it with no arguments for the menu. For scripts and tests:
+
+  thinky-restore snapshots [--kind configs|media] [--host H] [--filter TEXT]
+  thinky-restore app   --host H --app NAME [--snapshot ID] [--dry-run] [--yes]
+  thinky-restore db    --host H --db bookstack|readmeabook [--snapshot ID] [--scratch] [--dry-run] [--yes]
+  thinky-restore host  --host H [--snapshot ID] [--dry-run] [--yes]
+  thinky-restore media [--host H] (--filter TEXT | --all) [--into DIR] [--yes]
+
+Other options: --backend local|exec|image, --container NAME, --map FILE, --stage DIR.
+
+Nothing is replaced without you typing yes, and whatever was there is moved aside to
+<path>.before-restore-YYYYmmdd-HHMM, never deleted. Passwords are asked for with no echo
+(or taken from the environment) and are never written anywhere.
+EOF
+}
+
+# ===== commands: new functions go above this line =====
+
+tr_main() {
+  local sub
+  if [ $# -eq 0 ]; then
+    TR_INTERACTIVE=1
+    tr_need_root
+    if declare -F tr_menu >/dev/null; then tr_menu; else tr_usage; fi
+    return $?
+  fi
+  sub=$1
+  shift
+  case $sub in -h | --help | help) tr_usage; return 0 ;; esac
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --yes) TR_ASSUME_YES=1; shift ;;
+      --dry-run) TR_DRY_RUN=1; shift ;;
+      --scratch) TR_SCRATCH=1; shift ;;
+      --all) TR_ALL=1; shift ;;
+      --host | --snapshot | --app | --db | --filter | --into | --kind | --map | --stage | --backend | --container)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        case $1 in
+          --host) TR_HOST=$2 ;;
+          --snapshot) TR_SNAP=$2 ;;
+          --app) TR_APP=$2 ;;
+          --db) TR_DB=$2 ;;
+          --filter) TR_FILTER=$2 ;;
+          --into) TR_INTO=$2 ;;
+          --kind) TR_KIND=$2 ;;
+          --map) TR_MAPFILE=$2 ;;
+          --stage) TR_STAGE_ROOT=$2 ;;
+          --backend) TR_FORCED_BACKEND=$2 ;;
+          --container) TR_FORCED_CONTAINER=$2 ;;
+        esac
+        shift 2 ;;
+      *) die "unknown option: $1 (see --help)" ;;
+    esac
+  done
+  if declare -F "tr_cmd_$sub" >/dev/null; then
+    tr_need_root
+    "tr_cmd_$sub"
+  else
+    die "unknown command: $sub (see --help)"
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then tr_main "$@"; fi

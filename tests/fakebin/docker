@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""A fake `docker` for the thinky-restore tests. State lives in $FAKE_DOCKER_DIR:
+  ps            running container names, one per line
+  mounts/NAME   lines "DESTINATION<TAB>SOURCE"
+  log           one JSON array per call (the arguments, so tests can check no secret is on a command line)
+  stdin-N       what was piped into `docker exec -i`
+  count         the number printed for SELECT COUNT(*) queries (default 42)
+  ctr-scratch   stands in for a backup container's /scratch volume
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+d = pathlib.Path(os.environ["FAKE_DOCKER_DIR"])
+args = sys.argv[1:]
+with open(d / "log", "a") as fh:
+    fh.write(json.dumps(args) + "\n")
+
+
+def read_lines(p):
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def mounts(name):
+    return [line.split("\t", 1) for line in read_lines(d / "mounts" / name)]
+
+
+def run_restic(argv, remap):
+    env = dict(os.environ)
+    for var in ("RESTIC_REPOSITORY", "RESTIC_PASSWORD"):      # what the container would have in its own environment
+        if "FAKE_CTR_" + var in os.environ:
+            env[var] = os.environ["FAKE_CTR_" + var]
+    return subprocess.run([os.environ["REAL_RESTIC"], *[remap(a) for a in argv]], env=env).returncode
+
+
+cmd = args[0] if args else ""
+if cmd == "ps":
+    print("\n".join(read_lines(d / "ps")))
+elif cmd == "inspect":
+    name = args[-1]
+    fmt = args[args.index("-f") + 1] if "-f" in args else ""
+    if "Destination" in fmt:
+        want = fmt.split('"')[1]
+        print("".join(src for dst, src in mounts(name) if dst == want), end="")
+    else:
+        for _, src in mounts(name):
+            print(src)
+elif cmd in ("stop", "start"):
+    running = read_lines(d / "ps")
+    for name in args[1:]:
+        if cmd == "stop" and name in running:
+            running.remove(name)
+        if cmd == "start" and name not in running:
+            running.append(name)
+    (d / "ps").write_text("\n".join(running) + "\n")
+elif cmd == "volume" and args[1] == "create":
+    root = os.environ.get("TR_ROOT", "")
+    pathlib.Path(root + "/var/lib/docker/volumes/" + args[2] + "/_data").mkdir(parents=True, exist_ok=True)
+elif cmd == "logs":
+    print("ready for connections\nready for connections\nready to accept connections\nready to accept connections")
+elif cmd == "exec":
+    rest = args[1:]
+    interactive = False
+    while rest and rest[0] in ("-i", "-u", "-t"):
+        if rest[0] == "-u":
+            rest = rest[2:]
+        else:
+            interactive = interactive or rest[0] == "-i"
+            rest = rest[1:]
+    name, command = rest[0], rest[1:]
+    if os.environ.get("FAKE_DOCKER_FAIL") and os.environ["FAKE_DOCKER_FAIL"] in " ".join(command):
+        sys.exit(1)
+    scratch = str(d / "ctr-scratch")
+    if command[0] == "restic":
+        sys.exit(run_restic(command[1:], lambda a: scratch + a if a.startswith("/scratch") else a))
+    data = sys.stdin.buffer.read() if interactive else b""
+    if data:
+        n = len(list(d.glob("stdin-*")))
+        (d / f"stdin-{n}").write_bytes(data)
+    text = " ".join(command)
+    if command[:2] == ["sh", "-c"] and text.startswith("sh -c printf %s"):
+        var = command[2].split("$")[-1].rstrip('"')
+        print(os.environ.get("FAKE_CTR_" + var, "value-of-" + var), end="")
+    elif "COUNT(*)" in text or "count(*)" in text:
+        print((d / "count").read_text().strip() if (d / "count").exists() else "42")
+elif cmd == "run":
+    rest = args[1:]
+    vols, entry, detached, i = {}, None, False, 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--rm", "-d"):
+            detached = detached or a == "-d"
+            i += 1
+        elif a in ("--security-opt", "--name", "--network", "-p", "--restart"):
+            i += 2
+        elif a.startswith("--restart="):
+            i += 1
+        elif a == "-e":
+            i += 2
+        elif a == "-v":
+            src, dst = rest[i + 1].split(":")[:2]
+            vols[dst] = src
+            i += 2
+        elif a == "--entrypoint":
+            entry = rest[i + 1]
+            i += 2
+        else:
+            break
+    command = rest[i + 1:]
+    if entry == "restic":
+        def remap(a):
+            for dst, src in vols.items():
+                if a == dst or a.startswith(dst + "/"):
+                    return src + a[len(dst):]
+            return a
+        sys.exit(run_restic(command, remap))
+    if detached:
+        print("fakecontainerid")
+elif cmd == "rm":
+    pass
