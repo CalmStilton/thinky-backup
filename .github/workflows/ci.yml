@@ -28,10 +28,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"   # lowercase is required by GHCR
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/calmstilton/thinky-backup   # lowercase is required by GHCR
+          images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
             type=sha

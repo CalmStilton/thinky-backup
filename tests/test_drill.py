@@ -86,3 +86,56 @@ def test_drill_needs_a_target(make_cfg, pushes):
     cfg, restic = make_cfg()
     with pytest.raises(config.ConfigError, match="DRILL_"):
         drill.drill(cfg, restic, push=pushes)
+
+
+def _backed_up(make_cfg, tmp_path, pushes, name, data):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / name).write_bytes(data)
+    cfg, restic = make_cfg(BACKUP_SOURCES=str(src))
+    assert jobs.backup(cfg, restic, push=pushes) == 0
+    return src / name
+
+
+def test_drill_corrupt_gzip_reports_down(make_cfg, tmp_path, pushes):
+    good = gz(tmp_path / "full.sql.gz", "CREATE TABLE entities (id INT);\n" + "INSERT INTO entities VALUES (1);\n" * 5000)
+    data = open(good, "rb").read()
+    dump = _backed_up(make_cfg, tmp_path, pushes, "bad.sql.gz", data[: len(data) // 2])
+    cfg, restic = make_cfg(DRILL_MARIADB_FILE=str(dump))
+    assert drill.drill(cfg, restic, push=pushes) == 1
+    assert pushes[-1][1] is False
+    assert "mariadb:" in pushes[-1][2]
+
+
+def test_drill_not_gzip_reports_down(make_cfg, tmp_path, pushes):
+    dump = _backed_up(make_cfg, tmp_path, pushes, "bad.sql.gz", b"this is not gzip at all")
+    cfg, restic = make_cfg(DRILL_MARIADB_FILE=str(dump))
+    assert drill.drill(cfg, restic, push=pushes) == 1
+    assert pushes[-1][1] is False
+
+
+def test_drill_missing_binary_reports_down(make_cfg, tmp_path, pushes, monkeypatch):
+    dump = _backed_up(make_cfg, tmp_path, pushes, "x.dump", b"not a dump")
+    real_run = drill.subprocess.run
+
+    def run(args, *a, **kw):
+        if args[0] == "pg_restore":
+            raise FileNotFoundError(2, "No such file or directory", "pg_restore")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(drill.subprocess, "run", run)
+    cfg, restic = make_cfg(DRILL_PGDUMP_FILE=str(dump))
+    assert drill.drill(cfg, restic, push=pushes) == 1
+    assert pushes[-1][1] is False
+    assert "pg_dump:" in pushes[-1][2]
+
+
+def test_wait_for_server_bails_when_process_exited(monkeypatch):
+    class Dead:
+        def poll(self):
+            return 1
+
+    calls = []
+    monkeypatch.setattr(drill.subprocess, "run", lambda *a, **k: calls.append(a))
+    assert drill._wait_for_server("/nope", 30, Dead()) is False
+    assert calls == []

@@ -14,6 +14,9 @@ from .config import Config, ConfigError
 from .restic import Restic
 
 
+LOAD_TIMEOUT = 1800
+
+
 def check_sqlite(path: str) -> list[str]:
     if not os.path.exists(path):
         return [f"sqlite: {path} missing from snapshot"]
@@ -39,10 +42,12 @@ def check_pgdump(path: str) -> list[str]:
     return []
 
 
-def _wait_for_server(sock: str, timeout: float) -> bool:
+def _wait_for_server(sock: str, timeout: float, server=None) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        ping = subprocess.run(["mariadb-admin", f"--socket={sock}", "ping"], capture_output=True)
+        if server is not None and server.poll() is not None:
+            return False
+        ping = subprocess.run(["mariadb-admin", f"--socket={sock}", "ping"], capture_output=True, timeout=30)
         if ping.returncode == 0:
             return True
         time.sleep(0.5)
@@ -64,21 +69,32 @@ def check_mariadb(dump_gz: str, table: str, workdir: str, timeout: float = 60) -
                                "--skip-networking", "--skip-grant-tables", "--user=root"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        if not _wait_for_server(sock, timeout):
+        if not _wait_for_server(sock, timeout, server):
             return ["mariadb: scratch server did not start"]
         client = ["mariadb", f"--socket={sock}"]
-        subprocess.run([*client, "-e", "CREATE DATABASE drill"], check=True, capture_output=True)
+        subprocess.run([*client, "-e", "CREATE DATABASE drill"], check=True, capture_output=True,
+                       timeout=timeout)
         load = subprocess.Popen([*client, "drill"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        with gzip.open(dump_gz, "rb") as fh:
-            try:
-                shutil.copyfileobj(fh, load.stdin)
-            except BrokenPipeError:
-                pass
-        _, err = load.communicate()
+        try:
+            with gzip.open(dump_gz, "rb") as fh:
+                try:
+                    shutil.copyfileobj(fh, load.stdin)
+                except BrokenPipeError:
+                    pass
+        except BaseException:
+            load.kill()
+            load.communicate()
+            raise
+        try:
+            _, err = load.communicate(timeout=LOAD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            load.kill()
+            load.communicate()
+            return [f"mariadb: load timed out after {LOAD_TIMEOUT}s"]
         if load.returncode != 0:
             return [f"mariadb: load failed: {err.decode(errors='replace').strip()[:200]}"]
         out = subprocess.run([*client, "-N", "-B", "-e", f"SELECT COUNT(*) FROM drill.`{table}`"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, timeout=timeout)
         if out.returncode != 0:
             return [f"mariadb: count failed: {out.stderr.strip()[:200]}"]
         return [] if int(out.stdout.strip()) > 0 else [f"mariadb: table {table} is empty"]
@@ -105,11 +121,17 @@ def drill(cfg: Config, restic: Restic, push=None) -> int:
         else:
             def restored(p: str) -> str:
                 return os.path.join(tmp, p.lstrip("/"))
+            checks = []
             if cfg.drill_mariadb_file:
-                problems += check_mariadb(restored(cfg.drill_mariadb_file), cfg.drill_mariadb_table,
-                                          os.path.join(tmp, "_mariadb"))
+                checks.append(("mariadb", lambda: check_mariadb(
+                    restored(cfg.drill_mariadb_file), cfg.drill_mariadb_table, os.path.join(tmp, "_mariadb"))))
             if cfg.drill_sqlite_file:
-                problems += check_sqlite(restored(cfg.drill_sqlite_file))
+                checks.append(("sqlite", lambda: check_sqlite(restored(cfg.drill_sqlite_file))))
             if cfg.drill_pgdump_file:
-                problems += check_pgdump(restored(cfg.drill_pgdump_file))
+                checks.append(("pg_dump", lambda: check_pgdump(restored(cfg.drill_pgdump_file))))
+            for kind, check in checks:
+                try:
+                    problems += check()
+                except (OSError, EOFError, subprocess.SubprocessError, ValueError) as exc:
+                    problems.append(f"{kind}: {exc}")
     return jobs.finish(cfg.push_drill, f"{cfg.host}/{cfg.tag} drill", problems, push)
