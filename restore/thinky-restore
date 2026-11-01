@@ -634,6 +634,140 @@ tr_cmd_app() {
   fi
 }
 
+# ---- option 2: restore a database ------------------------------------------------------
+tr_db_define() {  # tr_db_define NAME : sets the TR_DB_* facts for a known database
+  case $1 in
+    bookstack)
+      TR_DB_KIND=mariadb
+      TR_DB_CONTAINER=bookstack_db
+      TR_DB_NAME=bookstackapp
+      TR_DB_DUMP=/src/opt/bookstack/db/backups/bookstack-nightly.sql.gz
+      TR_DB_HOSTDIR=/opt/bookstack/db/backups
+      TR_DB_CTRDIR=
+      TR_DB_TABLE=entities
+      ;;
+    readmeabook)
+      TR_DB_KIND=postgres
+      TR_DB_CONTAINER=readmeabook
+      TR_DB_NAME=readmeabook
+      TR_DB_DUMP=/src/opt/readmeabook/config/backups/readmeabook-nightly.dump
+      TR_DB_HOSTDIR=/opt/readmeabook/config/backups
+      TR_DB_CTRDIR=/app/config/backups
+      TR_DB_TABLE=
+      ;;
+    *) die "unknown database '$1' (bookstack or readmeabook)" ;;
+  esac
+}
+
+tr_wait_ready() {  # tr_wait_ready CONTAINER PATTERN : official images start a temporary server first, so wait for the second "ready"
+  local c=$1 pat=$2 tries=0
+  until [ "$(docker logs "$c" 2>&1 | grep -c -- "$pat")" -ge 2 ]; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 90 ] || die "the scratch database did not start"
+    sleep 2
+  done
+}
+
+tr_db_scratch() {  # tr_db_scratch DUMPFILE : load the dump into a throwaway container with no network; live data is untouched
+  local dump=$1 name=thinky-restore-scratch-$$ image count
+  TR_SCRATCH_CTR=$name
+  if [ "$TR_DB_KIND" = mariadb ]; then
+    image=${THINKY_RESTORE_MARIADB_IMAGE:-mariadb:11}
+    docker run -d --name "$name" --network none -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 \
+      -e MARIADB_DATABASE="$TR_DB_NAME" "$image" >/dev/null || die "could not start the scratch database"
+    tr_wait_ready "$name" 'ready for connections'
+    gzip -dc -- "$dump" | docker exec -i "$name" mariadb -u root "$TR_DB_NAME" || die "loading the dump into the scratch database failed"
+    count=$(docker exec "$name" mariadb -N -B -u root -e "SELECT COUNT(*) FROM $TR_DB_NAME.$TR_DB_TABLE") || die "could not count rows"
+    say "Scratch check: the dump loads, and table $TR_DB_TABLE has $count rows."
+  else
+    image=${THINKY_RESTORE_POSTGRES_IMAGE:-postgres:17}
+    docker run -d --name "$name" --network none -e POSTGRES_HOST_AUTH_METHOD=trust \
+      -e POSTGRES_DB="$TR_DB_NAME" "$image" >/dev/null || die "could not start the scratch database"
+    tr_wait_ready "$name" 'ready to accept connections'
+    docker exec -i "$name" pg_restore --no-owner -U postgres -d "$TR_DB_NAME" <"$dump" ||
+      warn "pg_restore reported problems (some are normal for a dump made by another role)"
+    count=$(docker exec "$name" psql -U postgres -d "$TR_DB_NAME" -At \
+      -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'") || die "could not count tables"
+    say "Scratch check: the dump loads, and the database has $count tables."
+  fi
+  docker rm -f "$name" >/dev/null 2>&1
+  TR_SCRATCH_CTR=
+}
+
+tr_db_live() {  # tr_db_live DUMPFILE : save the current database, then load the dump into the running one
+  local dump=$1 stamp pre hostdir count
+  stamp=$(date +%Y%m%d-%H%M)
+  hostdir=$TR_ROOT$TR_DB_HOSTDIR
+  tr_mkdir "$hostdir" || die "cannot create $hostdir"
+  if [ "$TR_DB_KIND" = mariadb ]; then
+    pre=$hostdir/bookstack-before-restore-$stamp.sql.gz
+    say "Saving the current database to $pre first ..."
+    if ! (umask 077 && docker exec "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb-dump --no-tablespaces -u $MYSQL_USER '"$TR_DB_NAME" | gzip >"$pre"); then
+      die "could not save the current database, so nothing was changed"
+    fi
+    say "Loading the backup ..."
+    gzip -dc -- "$dump" | docker exec -i "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb -u $MYSQL_USER '"$TR_DB_NAME" ||
+      die "loading failed. The database may be half loaded; the saved copy is $pre"
+    count=$(docker exec "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb -N -B -u $MYSQL_USER '"$TR_DB_NAME"' -e "SELECT COUNT(*) FROM '"$TR_DB_TABLE"'"') ||
+      die "loaded, but could not count the rows"
+    say "Done: table $TR_DB_TABLE now has $count rows. The previous database is saved at $pre"
+  else
+    pre=readmeabook-before-restore-$stamp.dump
+    say "Saving the current database to $hostdir/$pre first ..."
+    docker exec -u postgres "$TR_DB_CONTAINER" pg_dump -Fc -f "$TR_DB_CTRDIR/$pre" "$TR_DB_NAME" ||
+      die "could not save the current database, so nothing was changed"
+    cp -- "$dump" "$hostdir/readmeabook-restored-$stamp.dump" || die "could not copy the dump into $hostdir"
+    chmod 644 "$hostdir/readmeabook-restored-$stamp.dump" || die "could not make the copied dump readable"
+    say "Loading the backup ..."
+    if docker exec -u postgres "$TR_DB_CONTAINER" pg_restore --clean --if-exists -d "$TR_DB_NAME" \
+      "$TR_DB_CTRDIR/readmeabook-restored-$stamp.dump"; then
+      say "Done. The previous database is saved at $hostdir/$pre"
+    else
+      warn "pg_restore finished with messages (above). Check the app. The previous database is saved at $hostdir/$pre"
+    fi
+  fi
+}
+
+tr_cmd_db() {
+  local dump
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+  if [ -z "$TR_DB" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_choose TR_DB "Which database?" bookstack readmeabook; fi
+  tr_need TR_DB "Which database (bookstack or readmeabook)"
+  tr_db_define "$TR_DB"
+
+  tr_open_stage
+  say "Fetching the $TR_DB dump from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) ..."
+  tr_restore "$TR_SNAP_ID" "$TR_DB_DUMP"
+  dump=$TR_STAGE_HOST$TR_DB_DUMP
+  [ -s "$dump" ] || die "the dump is not in that snapshot ($TR_DB_DUMP)"
+  if [ "$TR_DB_KIND" = mariadb ]; then gzip -t -- "$dump" || die "the dump is damaged (gzip test failed)"; fi
+
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: the $TR_DB dump from $TR_SNAP_WHEN was fetched and looks intact. Nothing was loaded."
+    tr_close_stage
+    return 0
+  fi
+  if [ "$TR_SCRATCH" = 1 ]; then
+    tr_db_scratch "$dump"
+    tr_close_stage
+    return 0
+  fi
+  say ""
+  say "About to replace the tables of the running $TR_DB database ($TR_DB_CONTAINER) with the dump taken $TR_SNAP_WHEN."
+  say "The current database is saved first, beside the dumps."
+  confirm "Load the $TR_DB backup into the live database?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+  tr_db_live "$dump"
+  tr_close_stage
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
