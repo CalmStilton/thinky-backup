@@ -204,6 +204,7 @@ tr_offer_env_file() {  # a native host (such as AdGuard) keeps its settings in a
     local line k v
     while IFS= read -r line || [ -n "$line" ]; do
       line=${line#export }
+      line=${line%$'\r'}
       case $line in *=*) ;; *) continue ;; esac
       k=${line%%=*}
       v=${line#*=}
@@ -211,6 +212,7 @@ tr_offer_env_file() {  # a native host (such as AdGuard) keeps its settings in a
         RESTIC_REPOSITORY | RESTIC_PASSWORD | AWS_ACCESS_KEY_ID | AWS_SECRET_ACCESS_KEY | RCLONE_CONFIG_GDRIVE_[A-Z_]*) ;;
         *) continue ;;
       esac
+      [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
       case $v in
         \"*\") v=${v#\"}; v=${v%\"} ;;
         \'*\') v=${v#\'}; v=${v%\'} ;;

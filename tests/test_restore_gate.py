@@ -33,3 +33,13 @@ def test_a_signal_after_replacement_warns_and_leaves_them_stopped(tmp_path):
     assert r.returncode == 130
     assert "left stopped: web" in r.stderr
     assert not log.exists()
+
+
+def test_env_file_keys_with_subscripts_are_not_evaluated(tmp_path):
+    envf = tmp_path / "env"
+    envf.write_text("RCLONE_CONFIG_GDRIVE_X[$(touch PWNED)]=1\nRESTIC_PASSWORD=\"abc\"\r\n")
+    cmd = (f"source {SCRIPT}; confirm() {{ return 0; }}; THINKY_RESTORE_ENV_FILE={envf}; unset RESTIC_PASSWORD; "
+           "tr_offer_env_file; printf '%s' \"$RESTIC_PASSWORD\"")
+    r = bash(cmd, tmp_path)
+    assert r.stdout == "abc" and r.stderr == ""
+    assert not (tmp_path / "PWNED").exists()
