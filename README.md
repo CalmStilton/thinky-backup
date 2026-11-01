@@ -121,9 +121,9 @@ sudo bash thinky-restore
 |---|---|
 | 1. Restore one app | Fetches the app's folder and its clean SQLite copies from a snapshot, shows what will change, stops the containers that use it, moves the current folder aside, copies the backup in, puts the SQLite copies over the live databases (removing stale `-wal` and `-shm` files), starts the containers again and prints how to undo. |
 | 2. Restore a database | BookStack (MariaDB dump) or ReadMeABook (PostgreSQL dump). Saves the current database first, then loads the dump into the running container. `--scratch` loads it into a throwaway container with no network instead, to prove the dump works. |
-| 3. Rebuild a whole machine | Lays down every app folder, creates and fills the Docker volumes, puts the SQLite copies over their live files and offers to start Portainer. Nothing existing is overwritten: it is moved aside. |
+| 3. Rebuild a whole server | Lays down every app folder, creates and fills the Docker volumes, puts the SQLite copies over their live files and offers to start Portainer. Nothing existing is overwritten: it is moved aside. |
 | 4. Ebooks or audiobooks | Finds a title or author in the media repository and copies it into a folder, or restores everything and puts it back where the map says. |
-| 5. What is in the backups | Snapshots per machine with dates and sizes; `--filter TEXT` also lists matching files. |
+| 5. What is in the backups | Snapshots per server with dates and sizes; `--filter TEXT` also lists matching files. |
 
 The same commands work without the menu, which is how the tests drive it:
 `thinky-restore app --host H --app NAME [--snapshot ID] [--dry-run] [--yes]`, and likewise
@@ -143,7 +143,7 @@ Rules it keeps:
   one-off container from `THINKY_RESTORE_IMAGE` (default `ghcr.io/calmstilton/thinky-backup:latest`).
   `--backend local|exec|image` and `--container NAME` override that.
 
-Where snapshot folders belong on the machine: `/src/opt/NAME` goes to `/opt/NAME` and `/src/vol/NAME` to the
+Where snapshot folders belong on the server: `/src/opt/NAME` goes to `/opt/NAME` and `/src/vol/NAME` to the
 Docker volume `NAME`. Anything else needs a line in a map file (`/snapshot/path=/live/path`). The script
 reads `thinky-stack.map` from beside itself, or the file named by `--map` or `THINKY_RESTORE_MAP`. A native
 host (a snapshot without `/src`) is put back at the real paths, two levels down (for example
