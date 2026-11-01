@@ -880,6 +880,100 @@ tr_cmd_host() {
   fi
 }
 
+# ---- option 4: ebooks and audiobooks ---------------------------------------------------
+tr_media_matches() {  # tr_media_matches SNAPSHOT TEXT -> folders (author or title level) whose path contains TEXT
+  tr_restic ls "$1" 2>/dev/null | awk -v f="$2" '
+    BEGIN { f = tolower(f) }
+    substr($0, 1, 5) == "/src/" && index(tolower($0), f) {
+      n = split($0, p, "/")
+      if (n < 4) next
+      k = (n > 5 ? 5 : n)
+      s = ""
+      for (i = 2; i <= k; i++) s = s "/" p[i]
+      print s
+    }' | sort -u
+}
+
+tr_cmd_media() {
+  local matches=() list m picked sel stamp dest rel n
+  TR_KEEP_STAGE=0
+  tr_load_default_map
+  tr_select_backend media
+  if [ "$TR_ALL" = 1 ] && [ "$TR_BACKEND" = exec ]; then
+    # a full restore is tens of GB: do not fill the container's scratch volume
+    say "A full restore needs a big disk, so it runs in a one-off container instead of $TR_CONTAINER."
+    tr_adopt_env "$TR_CONTAINER" RESTIC_REPOSITORY RESTIC_PASSWORD RCLONE_CONFIG_GDRIVE_TYPE RCLONE_CONFIG_GDRIVE_SCOPE \
+      RCLONE_CONFIG_GDRIVE_CLIENT_ID RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
+    TR_CRED_KIND=media
+    TR_BACKEND=image
+    TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD
+      -e RCLONE_CONFIG_GDRIVE_TYPE -e RCLONE_CONFIG_GDRIVE_SCOPE -e RCLONE_CONFIG_GDRIVE_CLIENT_ID
+      -e RCLONE_CONFIG_GDRIVE_CLIENT_SECRET -e RCLONE_CONFIG_GDRIVE_TOKEN -e RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID)
+  else
+    tr_credentials media
+  fi
+  if [ -z "$TR_HOST" ]; then
+    list=$(tr_hosts media) || exit 1
+    [ -n "$list" ] || die "no media backups found"
+    if [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ]; then TR_HOST=$list; else tr_pick_host media; fi
+  fi
+  tr_need TR_HOST "Which machine's media backup (host name)"
+  tr_pick_snapshot media
+  stamp=$(date +%Y%m%d-%H%M)
+
+  if [ "$TR_ALL" = 1 ]; then
+    tr_need TR_INTO "A folder on a disk with enough space (the files are staged there first)"
+    TR_STAGE_ROOT=$TR_INTO
+    tr_open_stage
+    say "Restoring everything from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) into $TR_STAGE_HOST. This can take an hour or more."
+    confirm "Start the full restore?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+    tr_restic restore "$TR_SNAP_ID" --target "$TR_STAGE_ARG" >/dev/null || die "restic could not restore snapshot $TR_SNAP_ID"
+    tr_collect_units
+    tr_place_all
+    if [ "$TR_KEEP_STAGE" = 1 ]; then
+      TR_CLEANUP_DIRS=()
+      say "Some items were not put back. They are still in $TR_STAGE_HOST."
+    else
+      tr_close_stage
+    fi
+    return 0
+  fi
+
+  tr_need TR_FILTER "Part of the title or author to look for"
+  list=$(tr_media_matches "$TR_SNAP_ID" "$TR_FILTER") || exit 1
+  while IFS= read -r m; do [ -n "$m" ] && matches+=("$m"); done <<<"$list"
+  [ "${#matches[@]}" -gt 0 ] || die "nothing in snapshot $TR_SNAP_ID matches '$TR_FILTER'"
+  say "Found ${#matches[@]} match(es):"
+  n=1
+  for m in "${matches[@]:0:30}"; do printf '  %d) %s\n' "$n" "$m"; n=$((n + 1)); done
+  picked=("${matches[@]}")
+  if [ "$TR_INTERACTIVE" = 1 ]; then
+    ask sel "Which ones? Numbers separated by spaces, or all" all
+    if [ "$sel" != all ]; then
+      picked=()
+      for n in $sel; do
+        if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#matches[@]}" ]; then picked+=("${matches[$((n - 1))]}"); fi
+      done
+      [ "${#picked[@]}" -gt 0 ] || die "nothing chosen"
+    fi
+  fi
+  if [ -z "$TR_INTO" ]; then
+    if [ "$TR_INTERACTIVE" = 1 ]; then ask TR_INTO "Folder to put the restored files in" "$PWD/restored-$stamp"; else TR_INTO=$PWD/restored-$stamp; fi
+  fi
+
+  tr_open_stage
+  tr_restore "$TR_SNAP_ID" "${picked[@]}"
+  for m in "${picked[@]}"; do
+    rel=${m#/src/}
+    dest=$TR_INTO/$rel
+    mkdir -p -- "${dest%/*}"
+    cp -a -n -- "$TR_STAGE_HOST$m" "${dest%/*}/" || warn "could not copy $m"
+  done
+  tr_close_stage
+  say "Copied ${#picked[@]} item(s) into $TR_INTO. Files that were already there were kept. Nothing in your library was changed."
+  say "To add a book back to Calibre use Add books; for audiobooks copy the folder into the audiobooks share."
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
