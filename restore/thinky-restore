@@ -31,6 +31,7 @@ TR_STAGE_HOST=
 TR_STAGE_ARG=
 TR_STAGE_MOUNT=/restore
 TR_CRED_KIND=
+TR_ANNOUNCED=
 TR_SNAP_ID=
 TR_SNAP_WHEN=
 TR_LAST_ASIDE=
@@ -290,14 +291,17 @@ tr_select_backend() {  # tr_select_backend configs|media : exec (inside a backup
       elif command -v docker >/dev/null 2>&1; then
         TR_BACKEND=image
       else
-        die "this machine has neither restic nor docker"
+        die "this server has neither restic nor docker"
       fi
     fi
   fi
   case $TR_BACKEND in
     exec)
       [ -n "$TR_CONTAINER" ] || die "--backend exec needs --container NAME"
-      say "Using the backup container $TR_CONTAINER: nothing to type."
+      if [ "$TR_ANNOUNCED" != "$TR_CONTAINER" ]; then
+        say "Using the backup container $TR_CONTAINER: nothing to type."
+        TR_ANNOUNCED=$TR_CONTAINER
+      fi
       ;;
     local | image) ;;
     *) die "unknown backend '$TR_BACKEND' (local, exec or image)" ;;
@@ -371,7 +375,7 @@ tr_pick_host() {  # tr_pick_host TAG : in the menu, ask which machine
   list=$(tr_hosts "$1") || exit 1
   while IFS= read -r h; do [ -n "$h" ] && hosts+=("$h"); done <<<"$list"
   [ "${#hosts[@]}" -gt 0 ] || die "no backups found in this repository"
-  tr_choose TR_HOST "Which machine?" "${hosts[@]}"
+  tr_choose TR_HOST "Which server?" "${hosts[@]}"
 }
 
 tr_resolve_snapshot() {  # tr_resolve_snapshot TAG : sets TR_SNAP_ID and TR_SNAP_WHEN from --snapshot (default latest)
@@ -416,7 +420,7 @@ tr_cmd_snapshots() {
   if [ -n "$TR_HOST" ]; then hosts=$TR_HOST; else hosts=$(tr_hosts "$kind") || exit 1; fi
   [ -n "$hosts" ] || die "no '$kind' backups found"
   while IFS= read -r h; do
-    say "Machine: $h"
+    say "Server: $h"
     TR_HOST=$h
     tr_table "$kind" "$h" | while IFS=$'\t' read -r id when _ size; do
       printf '  %s  %s  %s\n' "$id" "$when" "$size"
@@ -473,7 +477,7 @@ tr_live_for() {  # tr_live_for SNAPSHOT_PATH -> where it lives on a real machine
 tr_ask_unmapped() {  # tr_ask_unmapped SNAPSHOT_PATH : in the menu, ask where an unmapped folder belongs (for this run only)
   local p=$1 dest=''
   [ "$TR_INTERACTIVE" = 1 ] || return 1
-  ask dest "Where on this machine should $p go? Full path, or press Enter to skip it"
+  ask dest "Where on this server should $p go? Full path, or press Enter to skip it"
   [ -n "$dest" ] || return 1
   case $dest in
     *..*) warn "'..' is not allowed"; return 1 ;;
@@ -603,17 +607,17 @@ tr_cmd_app() {
   tr_select_backend configs
   tr_credentials configs
   tr_pick_host configs
-  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_need TR_HOST "Which server's backup (host name)"
   tr_pick_snapshot configs
   if [ -z "$TR_APP" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_pick_app; fi
   tr_need TR_APP "Which app"
   unit=$(tr_resolve_unit "$TR_APP") || exit 1
   real=$(tr_live_for "$unit") || { tr_ask_unmapped "$unit" && real=$(tr_live_for "$unit"); } ||
-    die "do not know where $unit lives on this machine (see --map)"
+    die "do not know where $unit lives on this server (see --map)"
   live=$TR_ROOT$real
 
   tr_open_stage
-  say "Fetching $unit from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN, machine $TR_HOST) ..."
+  say "Fetching $unit from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN, server $TR_HOST) ..."
   tr_restore "$TR_SNAP_ID" "$unit" "/scratch/sqlite$unit"
   [ -e "$TR_STAGE_HOST$unit" ] || die "$unit is not in that snapshot"
 
@@ -623,13 +627,13 @@ tr_cmd_app() {
   if [ -e "$live" ]; then replaced="exists; it will be moved aside, not deleted"; fi
   say ""
   say "About to restore:"
-  say "  from:        snapshot $TR_SNAP_ID, taken $TR_SNAP_WHEN, machine $TR_HOST"
+  say "  from:        snapshot $TR_SNAP_ID, taken $TR_SNAP_WHEN, server $TR_HOST"
   say "  to:          $live ($replaced)"
   say "  databases:   $(find "$TR_STAGE_HOST/scratch/sqlite$unit" -type f 2>/dev/null | wc -l | tr -d ' ') SQLite copy/copies from the snapshot replace the live ones"
   say "  stops:       $cont_list (and starts them again afterwards)"
   say "  this is:     $(hostname)"
   if [ "$TR_DRY_RUN" = 1 ]; then
-    say "Dry run: nothing on this machine was changed."
+    say "Dry run: nothing on this server was changed."
     tr_close_stage
     return 0
   fi
@@ -649,6 +653,7 @@ tr_cmd_app() {
   if [ -n "$TR_LAST_ASIDE" ]; then
     say "The copy that was there is kept at: $TR_LAST_ASIDE"
     say "To undo: ${containers[*]:+docker stop ${containers[*]}; }mv '$live' '$live.rejected'; mv '$TR_LAST_ASIDE' '$live'${containers[*]:+; docker start ${containers[*]}}"
+    say "(In the menu, type 0 to leave it first: the line above is for the normal shell prompt.)"
     say "When you are happy with it, delete the old copy yourself."
   fi
 }
@@ -756,7 +761,7 @@ tr_cmd_db() {
   tr_select_backend configs
   tr_credentials configs
   tr_pick_host configs
-  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_need TR_HOST "Which server's backup (host name)"
   tr_pick_snapshot configs
   if [ -z "$TR_DB" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_choose TR_DB "Which database?" bookstack readmeabook; fi
   tr_need TR_DB "Which database (bookstack or readmeabook)"
@@ -787,7 +792,7 @@ tr_cmd_db() {
   tr_close_stage
 }
 
-# ---- option 3: rebuild a whole machine ---------------------------------------------------
+# ---- option 3: rebuild a whole server ---------------------------------------------------
 tr_ls_a() { ls -A -- "$1" 2>/dev/null; }
 
 tr_stage_units() {  # snapshot paths of everything in the stage that can be put back; unmapped /src/* are reported on stderr
@@ -864,7 +869,7 @@ tr_cmd_host() {
   tr_select_backend configs
   tr_credentials configs
   tr_pick_host configs
-  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_need TR_HOST "Which server's backup (host name)"
   tr_pick_snapshot configs
 
   tr_open_stage
@@ -875,7 +880,7 @@ tr_cmd_host() {
   [ "${#TR_UNITS[@]}" -gt 0 ] || die "that snapshot holds nothing this tool knows how to put back"
 
   say ""
-  say "This will put the following on THIS machine ($(hostname)):"
+  say "This will put the following on THIS server ($(hostname)):"
   for u in "${TR_UNITS[@]}"; do
     real=$(tr_live_for "$u") || continue
     live=$TR_ROOT$real
@@ -884,11 +889,11 @@ tr_cmd_host() {
     say "  $u -> $live ($note)"
   done
   if [ "$TR_DRY_RUN" = 1 ]; then
-    say "Dry run: nothing on this machine was changed."
+    say "Dry run: nothing on this server was changed."
     tr_close_stage
     return 0
   fi
-  confirm "Restore all of this from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) onto this machine?" ||
+  confirm "Restore all of this from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) onto this server?" ||
     { tr_close_stage; die "not confirmed; nothing was changed"; }
 
   tr_place_all
@@ -949,7 +954,7 @@ tr_cmd_media() {
     [ -n "$list" ] || die "no media backups found"
     if [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ]; then TR_HOST=$list; else tr_pick_host media; fi
   fi
-  tr_need TR_HOST "Which machine's media backup (host name)"
+  tr_need TR_HOST "Which server's media backup (host name)"
   tr_pick_snapshot media
   stamp=$(date +%Y%m%d-%H%M)
 
@@ -1030,7 +1035,7 @@ tr_menu() {
 
   1) Restore one app (for example Sonarr, or the Frigate settings)
   2) Restore a database (the wiki, or ReadMeABook)
-  3) Rebuild a whole machine
+  3) Rebuild a whole server (all its containers' data and settings)
   4) Get back ebooks or audiobooks
   5) Show what is in the backups
   0) Quit

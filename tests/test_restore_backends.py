@@ -15,7 +15,7 @@ def test_prompts_use_the_card_wording_and_never_echo_secrets(world, tmp_path):
                   "R2 Secret Access Key (card item 2)"):
         assert label in r.stderr
     assert f"Repository: {world.repo}" in r.stdout
-    assert "Machine: vm100" in r.stdout
+    assert "Server: vm100" in r.stdout
     for s in SECRETS:
         assert s not in r.stdout + r.stderr
 

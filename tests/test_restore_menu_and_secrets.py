@@ -6,14 +6,14 @@ from restore_support import AWS_ID, AWS_SECRET, PASSWORD, SECRETS, gz  # noqa: F
 def test_menu_quits_and_rejects_nonsense(world):
     r = world.run(stdin="9\n0\n")
     assert r.returncode == 0
-    assert "Rebuild a whole machine" in r.stderr and "Please type a number" in r.stdout
+    assert "Rebuild a whole server" in r.stderr and "Please type a number" in r.stdout
 
 
 def test_menu_shows_what_is_in_the_backups(world):
     world.backup("vm100", "configs", {"/src/opt/a/f": "1"})
     r = world.run(stdin="5\n0\n")
     assert r.returncode == 0, r.stderr
-    assert "Machine: vm100" in r.stdout
+    assert "Server: vm100" in r.stdout
 
 
 def test_menu_walks_through_an_app_restore(world):
@@ -53,7 +53,7 @@ def test_menu_asks_where_an_unmapped_folder_goes(world):
     world.backup("frigate", "configs", {"/src/opt/x/f": "1", "/src/frigate/config/c.yml": "cfg"})
     r = world.run(stdin="1\n1\n1\n/src/frigate/config\n/opt/frigate-new\nyes\n0\n")
     assert r.returncode == 0, r.stderr
-    assert "Where on this machine should /src/frigate/config go?" in r.stderr
+    assert "Where on this server should /src/frigate/config go?" in r.stderr
     assert (world.root / "opt/frigate-new/c.yml").read_text() == "cfg"
 
 
@@ -69,3 +69,21 @@ def test_rebuild_in_the_menu_asks_for_unmapped_folders(world):
     assert r.returncode == 0, r.stderr
     assert (world.root / "srv/mystery/data/d").read_text() == "m"
     assert (world.root / "opt/a/f").read_text() == "1"
+
+
+def test_menu_announces_the_backup_container_once(world):
+    world.backup("vm100", "configs", {"/src/opt/a/f": "1"})
+    world.set_running("backup-configs")
+    world.mount("backup-configs", "/scratch", str(world.dock / "ctr-scratch"))
+    r = world.run(stdin="5\n5\n0\n", TR_BACKEND="", RESTIC_PASSWORD=None, RESTIC_REPOSITORY=None,
+                  AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None, FAKE_CTR_RESTIC_PASSWORD=PASSWORD,
+                  FAKE_CTR_RESTIC_REPOSITORY=str(world.repo))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count("nothing to type") == 1
+
+
+def test_undo_line_says_to_leave_the_menu_first(world):
+    world.backup("vm100", "configs", {"/src/opt/sonarr/config.xml": "NEW"})
+    world.live("opt/sonarr/config.xml", "OLD")
+    r = world.run("app", "--host", "vm100", "--app", "sonarr", stdin="yes\n")
+    assert "type 0 to leave it first" in r.stdout

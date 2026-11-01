@@ -11,14 +11,14 @@ def test_snapshots_lists_each_machine_with_date_and_size(world):
     two_snapshots(world)
     r = world.run("snapshots")
     assert r.returncode == 0, r.stderr
-    assert "Machine: vm100" in r.stdout and "Machine: frigate" in r.stdout
+    assert "Server: vm100" in r.stdout and "Server: frigate" in r.stdout
     assert r.stdout.count("20") >= 3          # a date on every line
 
 
 def test_snapshots_can_be_limited_to_a_machine_and_filtered(world):
     two_snapshots(world)
     r = world.run("snapshots", "--host", "vm100", "--filter", "kuma")
-    assert "Machine: frigate" not in r.stdout
+    assert "Server: frigate" not in r.stdout
     assert "/src/vol/kuma/k" in r.stdout
 
 
