@@ -410,6 +410,132 @@ tr_cmd_snapshots() {
   done <<<"$hosts"
 }
 
+# ---- snapshot paths <-> live paths -------------------------------------------------
+tr_load_map() {  # tr_load_map FILE : lines "/snapshot/path=/live/path"; # starts a comment
+  local f=$1 line k v
+  [ -r "$f" ] || die "cannot read the map file $f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in '' | '#'*) continue ;; esac
+    k=${line%%=*}
+    v=${line#*=}
+    case "$k$v" in *..*) die "map $f: '..' is not allowed: $line" ;; esac
+    { [ "${k#/}" != "$k" ] && [ "${v#/}" != "$v" ]; } || die "map $f: both sides must be absolute paths: $line"
+    TR_MAP_SRC+=("${k%/}")
+    TR_MAP_DST+=("${v%/}")
+  done <"$f"
+}
+
+tr_live_for() {  # tr_live_for SNAPSHOT_PATH -> where it lives on a real machine (without TR_ROOT)
+  local p=$1 r name i k
+  case $p in */../* | */.. | .. | ../*) echo "refusing a path with '..': $p" >&2; return 1 ;; esac
+  case $p in
+    /src/opt/*) printf '/opt/%s\n' "${p#/src/opt/}"; return 0 ;;
+    /src/vol/*)
+      r=${p#/src/vol/}
+      name=${r%%/*}
+      printf '/var/lib/docker/volumes/%s/_data%s\n' "$name" "${r#"$name"}"
+      return 0
+      ;;
+  esac
+  for i in "${!TR_MAP_SRC[@]}"; do
+    k=${TR_MAP_SRC[$i]}
+    case $p in
+      "$k") printf '%s\n' "${TR_MAP_DST[$i]}"; return 0 ;;
+      "$k"/*) printf '%s%s\n' "${TR_MAP_DST[$i]}" "${p#"$k"}"; return 0 ;;
+    esac
+  done
+  case $p in
+    /src/* | /scratch/*) return 1 ;;
+    /?*) printf '%s\n' "$p" ;;     # a native host: snapshot paths are the real paths
+    *) return 1 ;;
+  esac
+}
+
+tr_ask_unmapped() {  # tr_ask_unmapped SNAPSHOT_PATH : in the menu, ask where an unmapped folder belongs (for this run only)
+  local p=$1 dest=''
+  [ "$TR_INTERACTIVE" = 1 ] || return 1
+  ask dest "Where on this machine should $p go? Full path, or press Enter to skip it"
+  [ -n "$dest" ] || return 1
+  case $dest in
+    *..*) warn "'..' is not allowed"; return 1 ;;
+    /?*) ;;
+    *) warn "that is not a full path"; return 1 ;;
+  esac
+  TR_MAP_SRC+=("${p%/}")
+  TR_MAP_DST+=("${dest%/}")
+}
+
+tr_load_default_map() {
+  local here
+  if [ -n "$TR_MAPFILE" ]; then tr_load_map "$TR_MAPFILE"; return; fi
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || return 0
+  if [ -r "$here/thinky-stack.map" ]; then tr_load_map "$here/thinky-stack.map"; fi
+}
+
+# ---- putting files back ----------------------------------------------------------------
+tr_mkdir() { ( umask 022 && mkdir -p -- "$1" ); }   # parents get normal permissions whatever umask the caller has
+
+tr_move_aside() {  # tr_move_aside LIVE : rename it to LIVE.before-restore-STAMP; sets TR_LAST_ASIDE (empty if nothing was there)
+  local live=$1 stamp aside n=0
+  TR_LAST_ASIDE=
+  if [ ! -e "$live" ] && [ ! -L "$live" ]; then return 0; fi
+  stamp=$(date +%Y%m%d-%H%M)
+  aside=$live.before-restore-$stamp
+  while [ -e "$aside" ]; do n=$((n + 1)); aside=$live.before-restore-$stamp-$n; done
+  mv -- "$live" "$aside" || die "could not move $live aside"
+  TR_LAST_ASIDE=$aside
+  TR_ASIDE_LIST+=("$live"$'\t'"$aside")
+}
+
+tr_old_copy_of() {  # where a live path's previous version was moved to, if it was
+  local pair live aside
+  for pair in ${TR_ASIDE_LIST[@]+"${TR_ASIDE_LIST[@]}"}; do
+    live=${pair%%$'\t'*}
+    aside=${pair#*$'\t'}
+    case $1 in "$live"/*) printf '%s%s\n' "$aside" "${1#"$live"}"; return 0 ;; esac
+  done
+  return 0
+}
+
+tr_ensure_volume() {  # tr_ensure_volume NAME : a docker volume must exist before its folder can be filled
+  local name=${1%%/*}
+  [ -d "$TR_ROOT/var/lib/docker/volumes/$name/_data" ] && return 0
+  docker volume create "$name" >/dev/null || die "could not create the docker volume $name"
+}
+
+tr_place_unit() {  # tr_place_unit SNAPSHOT_PATH : staged copy -> live path, old copy moved aside
+  local unit=$1 real live
+  real=$(tr_live_for "$unit") || { warn "no live path known for $unit; skipped"; return 1; }
+  live=$TR_ROOT$real
+  [ -e "$TR_STAGE_HOST$unit" ] || { warn "$unit is not in the snapshot; skipped"; return 1; }
+  case $unit in /src/vol/*) tr_ensure_volume "${unit#/src/vol/}" ;; esac
+  if [ -d "$live" ] && [ -z "$(ls -A -- "$live" 2>/dev/null)" ]; then rmdir -- "$live"; fi
+  tr_move_aside "$live"
+  tr_mkdir "${live%/*}" || die "cannot create ${live%/*}"
+  cp -a -- "$TR_STAGE_HOST$unit" "$live" ||
+    die "copying to $live failed. The previous copy is at ${TR_LAST_ASIDE:-(nothing was there)}"
+}
+
+tr_overlay_sqlite() {  # tr_overlay_sqlite [SNAPSHOT_PATH_PREFIX] : clean SQLite copies from the snapshot over their live files
+  local root=$TR_STAGE_HOST/scratch/sqlite prefix=${1:-} f orig real live ref uid mode
+  TR_OVERLAID=0
+  if [ ! -e "$root$prefix" ]; then return 0; fi
+  while IFS= read -r -d '' f; do
+    orig=${f#"$root"}
+    real=$(tr_live_for "$orig") || { warn "no live path for the database copy $orig; skipped"; continue; }
+    live=$TR_ROOT$real
+    ref=$(tr_old_copy_of "$live")
+    if [ -z "$ref" ] || [ ! -e "$ref" ]; then ref=${live%/*}; fi
+    tr_mkdir "${live%/*}"
+    rm -f -- "$live" "$live-wal" "$live-shm"
+    cp -- "$f" "$live" || die "could not write $live"
+    uid=$(stat -c '%u:%g' -- "$ref")
+    chown "$uid" -- "$live"
+    if [ -f "$ref" ]; then mode=$(stat -c '%a' -- "$ref"); chmod "$mode" -- "$live"; fi
+    TR_OVERLAID=$((TR_OVERLAID + 1))
+  done < <(find "$root$prefix" -type f -print0)
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {

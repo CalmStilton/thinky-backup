@@ -1,0 +1,8 @@
+# Where the Thinky stack's snapshot folders belong when a machine is rebuilt.
+# One per line:  /folder/in/the/snapshot=/folder/on/the/machine
+# Folders under /src/opt and /src/vol need no line: they go to /opt and to docker volumes.
+/src/thames-water/data=/root/thames-water-service/data
+/src/frigate/config=/opt/frigate/config
+/src/alfiecodes=/docker/alfiecodes
+/src/calibre-library=/opt/calibre/config/Calibre Library
+/src/audiobooks=/srv/media/audiobooks
