@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 
@@ -41,8 +42,9 @@ def test_non_root_is_told_to_use_sudo():
 
 def test_the_tool_holds_no_site_specific_values():
     text = SCRIPT.read_text().lower()
-    for word in ("lukmor", "192.168", "daa7be88", "thinky-configs", "cloudflarestorage"):
+    for word in ("lukmor", "192.168", "cloudflarestorage"):
         assert word not in text, word
+    assert not re.search(r"\b[0-9a-f]{32}\b", text)
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")

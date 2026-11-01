@@ -115,12 +115,11 @@ def check_restore_tool(cfg: Config, env: dict[str, str], stage: str, tool: str |
     cmd = [tool, "app", "--host", cfg.host, "--app", cfg.drill_restore_app, "--dry-run", "--stage", stage]
     try:
         out = subprocess.run(cmd, env={**os.environ, **env, "TR_BACKEND": "local"}, capture_output=True, text=True,
-                             timeout=RESTORE_TOOL_TIMEOUT)
+                             stdin=subprocess.DEVNULL, timeout=RESTORE_TOOL_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as exc:
         return [f"restore tool: {exc}"]
     if out.returncode != 0:
-        lines = out.stderr.strip().splitlines()
-        return [f"restore tool: dry run of {cfg.drill_restore_app} failed: {(lines[-1] if lines else 'no message')[:200]}"]
+        return [f"restore tool: dry run of {cfg.drill_restore_app} failed (exit {out.returncode})"]
     return []
 
 

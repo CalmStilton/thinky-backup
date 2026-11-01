@@ -107,7 +107,7 @@ tr_cleanup_stage() {
   TR_CLEANUP_DIRS=()
   TR_STAGE_HOST=
   if [ -n "$TR_SCRATCH_CTR" ] && command -v docker >/dev/null 2>&1; then
-    docker rm -f "$TR_SCRATCH_CTR" >/dev/null 2>&1
+    docker rm -fv "$TR_SCRATCH_CTR" >/dev/null 2>&1
     TR_SCRATCH_CTR=
   fi
 }
@@ -120,6 +120,7 @@ tr_abort_cleanup() {  # on an error: restart what we stopped only if nothing was
     else
       warn "stopped containers were left stopped: ${TR_STOPPED[*]}. Something was already replaced; the old copy is kept next to it as *.before-restore-*."
     fi
+    TR_STOPPED=()
   fi
   tr_cleanup_stage
 }
@@ -130,8 +131,11 @@ tr_unset_creds() {
     RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
 }
 
-tr_on_exit() { tr_cleanup_stage; tr_unset_creds; }
+tr_on_exit() { tr_abort_cleanup; tr_unset_creds; }
 trap tr_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 tr_need_root() {  # restores write to /opt, docker volumes and containers: they need root
   if [ "$(id -u)" -ne 0 ] && [ -z "$TR_ROOT" ]; then die "run this with sudo, for example: sudo bash thinky-restore"; fi
@@ -197,10 +201,23 @@ tr_offer_env_file() {  # a native host (such as AdGuard) keeps its settings in a
   local f=${THINKY_RESTORE_ENV_FILE:-/etc/thinky-backup/env}
   { [ -z "${RESTIC_PASSWORD:-}" ] && [ -r "$f" ]; } || return 0
   if confirm "Found saved backup settings in $f. Use them?"; then
-    set -a
-    # shellcheck source=/dev/null
-    . "$f"
-    set +a
+    local line k v
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line#export }
+      case $line in *=*) ;; *) continue ;; esac
+      k=${line%%=*}
+      v=${line#*=}
+      case $k in
+        RESTIC_REPOSITORY | RESTIC_PASSWORD | AWS_ACCESS_KEY_ID | AWS_SECRET_ACCESS_KEY | RCLONE_CONFIG_GDRIVE_[A-Z_]*) ;;
+        *) continue ;;
+      esac
+      case $v in
+        \"*\") v=${v#\"}; v=${v%\"} ;;
+        \'*\') v=${v#\'}; v=${v%\'} ;;
+      esac
+      printf -v "$k" '%s' "$v"
+      export "${k?}"
+    done <"$f"
   fi
 }
 
@@ -320,7 +337,7 @@ tr_open_stage() {  # makes a private staging folder; sets TR_STAGE_HOST (where w
       if [ "$TR_BACKEND" = image ]; then TR_STAGE_ARG=$TR_STAGE_MOUNT; fi
       ;;
   esac
-  (umask 077 && mkdir -p -- "$TR_STAGE_HOST") || die "cannot create $TR_STAGE_HOST"
+  (umask 077 && mkdir -p -- "${TR_STAGE_HOST%/*}" && mkdir -- "$TR_STAGE_HOST") || die "cannot create $TR_STAGE_HOST (it must not already exist)"
   TR_CLEANUP_DIRS+=("$TR_STAGE_HOST")
 }
 
@@ -329,7 +346,7 @@ tr_close_stage() { tr_cleanup_stage; }
 tr_restore() {  # tr_restore SNAPSHOT_ID PATH... : fetch just these paths into the stage
   local snap=$1 a=() p
   shift
-  for p in "$@"; do a+=(--include "$p"); done
+  for p in "$@"; do a+=(--include "$(printf '%s' "$p" | sed 's/[][\\*?]/\\&/g')"); done
   tr_restic restore "$snap" --target "$TR_STAGE_ARG" "${a[@]}" >/dev/null || die "restic could not restore from snapshot $snap"
 }
 
@@ -617,8 +634,8 @@ tr_cmd_app() {
   confirm "Replace $live with the backup?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
 
   if [ "${#containers[@]}" -gt 0 ]; then
-    docker stop "${containers[@]}" >/dev/null || die "could not stop ${containers[*]}"
     TR_STOPPED=("${containers[@]}")
+    docker stop "${containers[@]}" >/dev/null || die "could not stop ${containers[*]}"
   fi
   tr_place_unit "$unit" || die "nothing was restored"
   tr_overlay_sqlite "$unit"
@@ -690,13 +707,13 @@ tr_db_scratch() {  # tr_db_scratch DUMPFILE : load the dump into a throwaway con
       -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'") || die "could not count tables"
     say "Scratch check: the dump loads, and the database has $count tables."
   fi
-  docker rm -f "$name" >/dev/null 2>&1
+  docker rm -fv "$name" >/dev/null 2>&1
   TR_SCRATCH_CTR=
 }
 
 tr_db_live() {  # tr_db_live DUMPFILE : save the current database, then load the dump into the running one
   local dump=$1 stamp pre hostdir count
-  stamp=$(date +%Y%m%d-%H%M)
+  stamp=$(date +%Y%m%d-%H%M%S)
   hostdir=$TR_ROOT$TR_DB_HOSTDIR
   tr_mkdir "$hostdir" || die "cannot create $hostdir"
   if [ "$TR_DB_KIND" = mariadb ]; then
@@ -772,7 +789,7 @@ tr_cmd_db() {
 tr_ls_a() { ls -A -- "$1" 2>/dev/null; }
 
 tr_stage_units() {  # snapshot paths of everything in the stage that can be put back; unmapped /src/* are reported on stderr
-  local n top sub k covered
+  local n top sub k covered any exact
   if [ -d "$TR_STAGE_HOST/src/opt" ]; then
     while IFS= read -r n; do printf '/src/opt/%s\n' "$n"; done < <(tr_ls_a "$TR_STAGE_HOST/src/opt")
   fi
@@ -785,11 +802,24 @@ tr_stage_units() {  # snapshot paths of everything in the stage that can be put 
   if [ -d "$TR_STAGE_HOST/src" ]; then
     while IFS= read -r top; do
       case $top in opt | vol) continue ;; esac
-      covered=0
+      any=0 exact=0
       for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
-        case $k in "/src/$top" | "/src/$top"/*) covered=1 ;; esac
+        case $k in
+          "/src/$top") exact=1; any=1 ;;
+          "/src/$top"/*) any=1 ;;
+        esac
       done
-      if [ "$covered" = 0 ]; then echo "UNMAPPED /src/$top" >&2; fi
+      if [ "$any" = 0 ]; then
+        echo "UNMAPPED /src/$top" >&2
+      elif [ "$exact" = 0 ]; then   # some of it is mapped: report each sibling that is not
+        while IFS= read -r sub; do
+          covered=0
+          for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+            case $k in "/src/$top/$sub" | "/src/$top/$sub"/*) covered=1 ;; esac
+          done
+          if [ "$covered" = 0 ]; then echo "UNMAPPED /src/$top/$sub" >&2; fi
+        done < <(tr_ls_a "$TR_STAGE_HOST/src/$top")
+      fi
     done < <(tr_ls_a "$TR_STAGE_HOST/src")
   fi
   while IFS= read -r top; do   # a native host: real paths, two levels down (for example /opt/AdGuardHome)

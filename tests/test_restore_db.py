@@ -18,7 +18,7 @@ def test_scratch_load_never_touches_the_live_database(world):
     assert not any("bookstack_db" in " ".join(c) for c in cmds(world))
     loaded = next(p for p in sorted(world.dock.glob("stdin-*")))
     assert loaded.read_bytes() == b"DROP TABLE IF EXISTS entities;"
-    assert ["rm", "-f"] == next(c for c in cmds(world) if c[0] == "rm")[:2]
+    assert ["rm", "-fv"] == next(c for c in cmds(world) if c[0] == "rm")[:2]
 
 
 def test_postgres_scratch_check(world):

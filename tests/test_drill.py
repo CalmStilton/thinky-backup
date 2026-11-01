@@ -178,7 +178,8 @@ def test_drill_reports_a_failing_restore_tool(make_cfg, tmp_path, pushes, monkey
     _fake_tool(tmp_path, monkeypatch, fail="opt/prowlarr is not in that snapshot")
     cfg, restic = make_cfg(DRILL_RESTORE_APP="opt/prowlarr")
     assert drill.drill(cfg, restic, push=pushes) == 1
-    assert pushes[-1][1] is False and "not in that snapshot" in pushes[-1][2]
+    assert pushes[-1][1] is False and "failed (exit 1)" in pushes[-1][2]
+    assert "not in that snapshot" not in pushes[-1][2]
 
 
 def test_drill_reports_a_missing_restore_tool(make_cfg, tmp_path, pushes, monkeypatch):

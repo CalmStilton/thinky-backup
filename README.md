@@ -132,8 +132,9 @@ The same commands work without the menu, which is how the tests drive it:
 Rules it keeps:
 
 - **Nothing is replaced without you typing `yes`**, and `--dry-run` shows the plan and changes nothing.
-- **Nothing is deleted.** What was there is renamed to `<path>.before-restore-YYYYmmdd-HHMM`. A database is
-  saved to a file before the dump is loaded.
+- **No existing data is deleted.** What was there is renamed to `<path>.before-restore-YYYYmmdd-HHMM`; only stale
+  SQLite `-wal`/`-shm` files are removed when a clean SQLite copy is put over a live database. A database is saved
+  to a file before the dump is loaded.
 - **Secrets are never printed, logged, written to disk or put on a command line.** They are read with
   `read -s` (or taken from the environment) and passed to Docker as `-e NAME`. The script refuses to run
   with `bash -x`.
