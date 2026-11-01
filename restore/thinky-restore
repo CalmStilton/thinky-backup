@@ -536,6 +536,104 @@ tr_overlay_sqlite() {  # tr_overlay_sqlite [SNAPSHOT_PATH_PREFIX] : clean SQLite
   done < <(find "$root$prefix" -type f -print0)
 }
 
+# ---- option 1: restore one app ---------------------------------------------------------
+tr_resolve_unit() {  # tr_resolve_unit NAME -> its snapshot path: opt/NAME, vol/NAME or an absolute path
+  local name=$1 o v
+  case $name in
+    /*) printf '%s\n' "$name"; return 0 ;;
+    opt/* | vol/*) printf '/src/%s\n' "$name"; return 0 ;;
+  esac
+  o=$(tr_children "$TR_SNAP_ID" /src/opt | grep -Fx -- "$name" || true)
+  v=$(tr_children "$TR_SNAP_ID" /src/vol | grep -Fx -- "$name" || true)
+  if [ -n "$o" ] && [ -n "$v" ]; then die "'$name' is both an app folder and a volume: say opt/$name or vol/$name"; fi
+  if [ -n "$o" ]; then printf '/src/opt/%s\n' "$name"
+  elif [ -n "$v" ]; then printf '/src/vol/%s\n' "$name"
+  else die "no app called '$name' in snapshot $TR_SNAP_ID (option 5 lists what is there)"; fi
+}
+
+tr_pick_app() {  # in the menu: list the apps in the chosen snapshot
+  local names=() n list
+  list=$( (tr_children "$TR_SNAP_ID" /src/opt | sed 's#^#opt/#'; tr_children "$TR_SNAP_ID" /src/vol | sed 's#^#vol/#') )
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done <<<"$list"
+  [ "${#names[@]}" -gt 0 ] || die "that snapshot has no apps in the usual places; try option 3 for a native host"
+  tr_choose TR_APP "Which app? (number or name)" "${names[@]}"
+}
+
+tr_containers_using() {  # tr_containers_using NAME PATH : running containers called NAME or with a mount at or under PATH
+  local n s
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ "$n" = "$1" ]; then printf '%s\n' "$n"; continue; fi
+    while IFS= read -r s; do
+      case $s in "$2" | "$2"/*) printf '%s\n' "$n"; break ;; esac
+    done < <(docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$n" 2>/dev/null)
+  done < <(docker ps --format '{{.Names}}')
+}
+
+tr_start_stopped() {
+  if [ "${#TR_STOPPED[@]}" -gt 0 ]; then
+    docker start "${TR_STOPPED[@]}" >/dev/null || warn "could not start: ${TR_STOPPED[*]}"
+    TR_STOPPED=()
+  fi
+}
+
+tr_cmd_app() {
+  local unit real live c containers=() cont_list="none" replaced
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+  if [ -z "$TR_APP" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_pick_app; fi
+  tr_need TR_APP "Which app"
+  unit=$(tr_resolve_unit "$TR_APP") || exit 1
+  real=$(tr_live_for "$unit") || { tr_ask_unmapped "$unit" && real=$(tr_live_for "$unit"); } ||
+    die "do not know where $unit lives on this machine (see --map)"
+  live=$TR_ROOT$real
+
+  tr_open_stage
+  say "Fetching $unit from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN, machine $TR_HOST) ..."
+  tr_restore "$TR_SNAP_ID" "$unit" "/scratch/sqlite$unit"
+  [ -e "$TR_STAGE_HOST$unit" ] || die "$unit is not in that snapshot"
+
+  while IFS= read -r c; do [ -n "$c" ] && containers+=("$c"); done < <(tr_containers_using "${unit##*/}" "$real")
+  if [ "${#containers[@]}" -gt 0 ]; then cont_list=${containers[*]}; fi
+  replaced="nothing there yet"
+  if [ -e "$live" ]; then replaced="exists; it will be moved aside, not deleted"; fi
+  say ""
+  say "About to restore:"
+  say "  from:        snapshot $TR_SNAP_ID, taken $TR_SNAP_WHEN, machine $TR_HOST"
+  say "  to:          $live ($replaced)"
+  say "  databases:   $(find "$TR_STAGE_HOST/scratch/sqlite$unit" -type f 2>/dev/null | wc -l | tr -d ' ') SQLite copy/copies from the snapshot replace the live ones"
+  say "  stops:       $cont_list (and starts them again afterwards)"
+  say "  this is:     $(hostname)"
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: nothing on this machine was changed."
+    tr_close_stage
+    return 0
+  fi
+  confirm "Replace $live with the backup?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+
+  if [ "${#containers[@]}" -gt 0 ]; then
+    docker stop "${containers[@]}" >/dev/null || die "could not stop ${containers[*]}"
+    TR_STOPPED=("${containers[@]}")
+  fi
+  tr_place_unit "$unit" || die "nothing was restored"
+  tr_overlay_sqlite "$unit"
+  tr_start_stopped
+  tr_close_stage
+
+  say ""
+  say "Done: $live is back as of $TR_SNAP_WHEN."
+  if [ -n "$TR_LAST_ASIDE" ]; then
+    say "The copy that was there is kept at: $TR_LAST_ASIDE"
+    say "To undo: ${containers[*]:+docker stop ${containers[*]}; }mv '$live' '$live.rejected'; mv '$TR_LAST_ASIDE' '$live'${containers[*]:+; docker start ${containers[*]}}"
+    say "When you are happy with it, delete the old copy yourself."
+  fi
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
