@@ -69,3 +69,21 @@ def test_rebuild_in_the_menu_asks_for_unmapped_folders(world):
     assert r.returncode == 0, r.stderr
     assert (world.root / "srv/mystery/data/d").read_text() == "m"
     assert (world.root / "opt/a/f").read_text() == "1"
+
+
+def test_menu_announces_the_backup_container_once(world):
+    world.backup("vm100", "configs", {"/src/opt/a/f": "1"})
+    world.set_running("backup-configs")
+    world.mount("backup-configs", "/scratch", str(world.dock / "ctr-scratch"))
+    r = world.run(stdin="5\n5\n0\n", TR_BACKEND="", RESTIC_PASSWORD=None, RESTIC_REPOSITORY=None,
+                  AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None, FAKE_CTR_RESTIC_PASSWORD=PASSWORD,
+                  FAKE_CTR_RESTIC_REPOSITORY=str(world.repo))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count("nothing to type") == 1
+
+
+def test_undo_line_says_to_leave_the_menu_first(world):
+    world.backup("vm100", "configs", {"/src/opt/sonarr/config.xml": "NEW"})
+    world.live("opt/sonarr/config.xml", "OLD")
+    r = world.run("app", "--host", "vm100", "--app", "sonarr", stdin="yes\n")
+    assert "type 0 to leave it first" in r.stdout

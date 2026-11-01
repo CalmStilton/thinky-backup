@@ -31,6 +31,7 @@ TR_STAGE_HOST=
 TR_STAGE_ARG=
 TR_STAGE_MOUNT=/restore
 TR_CRED_KIND=
+TR_ANNOUNCED=
 TR_SNAP_ID=
 TR_SNAP_WHEN=
 TR_LAST_ASIDE=
@@ -297,7 +298,10 @@ tr_select_backend() {  # tr_select_backend configs|media : exec (inside a backup
   case $TR_BACKEND in
     exec)
       [ -n "$TR_CONTAINER" ] || die "--backend exec needs --container NAME"
-      say "Using the backup container $TR_CONTAINER: nothing to type."
+      if [ "$TR_ANNOUNCED" != "$TR_CONTAINER" ]; then
+        say "Using the backup container $TR_CONTAINER: nothing to type."
+        TR_ANNOUNCED=$TR_CONTAINER
+      fi
       ;;
     local | image) ;;
     *) die "unknown backend '$TR_BACKEND' (local, exec or image)" ;;
@@ -649,6 +653,7 @@ tr_cmd_app() {
   if [ -n "$TR_LAST_ASIDE" ]; then
     say "The copy that was there is kept at: $TR_LAST_ASIDE"
     say "To undo: ${containers[*]:+docker stop ${containers[*]}; }mv '$live' '$live.rejected'; mv '$TR_LAST_ASIDE' '$live'${containers[*]:+; docker start ${containers[*]}}"
+    say "(In the menu, type 0 to leave it first: the line above is for the normal shell prompt.)"
     say "When you are happy with it, delete the old copy yourself."
   fi
 }
