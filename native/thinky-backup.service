@@ -1,0 +1,11 @@
+[Unit]
+Description=thinky-backup: restic backup to the off-site repo
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/thinky-backup/env
+ExecStart=/usr/local/bin/thinky-backup-native
+Nice=10
+IOSchedulingClass=idle

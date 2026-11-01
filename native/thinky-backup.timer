@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly thinky-backup
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 Europe/London
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
