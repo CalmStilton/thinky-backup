@@ -47,6 +47,7 @@ the table below lists every variable it reads, with its default and meaning.
 | `DRILL_MARIADB_TABLE` | `entities` | table whose row count the MariaDB drill reports; plain names only |
 | `DRILL_SQLITE_FILE` | empty | path inside the snapshot of a SQLite database to integrity-check |
 | `DRILL_PGDUMP_FILE` | empty | path inside the snapshot of a PostgreSQL custom-format dump to list |
+| `DRILL_RESTORE_APP` | empty | an app such as `opt/prowlarr`: the drill runs `thinky-restore app --dry-run` for it against the real repository; a failure is a drill failure |
 
 The native script (below) reads its own variables: `CONF_DIR` (default `/etc/thinky-backup`),
 `FORGET_ARGS` (same default as above), `KUMA_PUSH_BACKUP`, and the four restic and host
@@ -102,6 +103,61 @@ the monitor's heartbeat interval is what catches it. A missing restic binary is 
 failed backup, so Kuma gets a down push. Put the variables in `/etc/thinky-backup/env` (the unit's `EnvironmentFile`),
 install the script as `/usr/local/bin/thinky-backup-native`, and override the timer's
 `OnCalendar` with a drop-in for each host's schedule.
+
+## Guided restores: `thinky-restore`
+
+`restore/thinky-restore` is one bash script that restores from these repositories by asking
+questions, so nobody has to type multi-line shell during an emergency. It needs bash, `restic`
+or `docker`, and root.
+
+```sh
+R=https://raw.githubusercontent.com/CalmStilton/thinky-backup/<commit>/restore
+curl -fsSLo thinky-restore $R/thinky-restore
+curl -fsSLo thinky-stack.map $R/thinky-stack.map     # optional, see below; keep it beside the script
+sudo bash thinky-restore
+```
+
+| Menu choice | What it does |
+|---|---|
+| 1. Restore one app | Fetches the app's folder and its clean SQLite copies from a snapshot, shows what will change, stops the containers that use it, moves the current folder aside, copies the backup in, puts the SQLite copies over the live databases (removing stale `-wal` and `-shm` files), starts the containers again and prints how to undo. |
+| 2. Restore a database | BookStack (MariaDB dump) or ReadMeABook (PostgreSQL dump). Saves the current database first, then loads the dump into the running container. `--scratch` loads it into a throwaway container with no network instead, to prove the dump works. |
+| 3. Rebuild a whole machine | Lays down every app folder, creates and fills the Docker volumes, puts the SQLite copies over their live files and offers to start Portainer. Nothing existing is overwritten: it is moved aside. |
+| 4. Ebooks or audiobooks | Finds a title or author in the media repository and copies it into a folder, or restores everything and puts it back where the map says. |
+| 5. What is in the backups | Snapshots per machine with dates and sizes; `--filter TEXT` also lists matching files. |
+
+The same commands work without the menu, which is how the tests drive it:
+`thinky-restore app --host H --app NAME [--snapshot ID] [--dry-run] [--yes]`, and likewise
+`db`, `host`, `media` and `snapshots` (`thinky-restore --help` lists the options).
+
+Rules it keeps:
+
+- **Nothing is replaced without you typing `yes`**, and `--dry-run` shows the plan and changes nothing.
+- **No existing data is deleted.** What was there is renamed to `<path>.before-restore-YYYYmmdd-HHMM`; only stale
+  SQLite `-wal`/`-shm` files are removed when a clean SQLite copy is put over a live database. A database is saved
+  to a file before the dump is loaded.
+- **Secrets are never printed, logged, written to disk or put on a command line.** They are read with
+  `read -s` (or taken from the environment) and passed to Docker as `-e NAME`. The script refuses to run
+  with `bash -x`.
+- Where restic runs: inside a running backup container if there is one (`backup-configs`, `backup-frigate`,
+  `backup-alfiecodes`, `backup-media`: nothing to type); otherwise with the local `restic`; otherwise in a
+  one-off container from `THINKY_RESTORE_IMAGE` (default `ghcr.io/calmstilton/thinky-backup:latest`).
+  `--backend local|exec|image` and `--container NAME` override that.
+
+Where snapshot folders belong on the machine: `/src/opt/NAME` goes to `/opt/NAME` and `/src/vol/NAME` to the
+Docker volume `NAME`. Anything else needs a line in a map file (`/snapshot/path=/live/path`). The script
+reads `thinky-stack.map` from beside itself, or the file named by `--map` or `THINKY_RESTORE_MAP`. A native
+host (a snapshot without `/src`) is put back at the real paths, two levels down (for example
+`/opt/AdGuardHome`). Optional non-secret defaults go in `/etc/thinky-restore.conf` (or
+`THINKY_RESTORE_CONF`): `CONFIGS_REPOSITORY=` and `MEDIA_REPOSITORY=`.
+
+Other settings: `THINKY_RESTORE_ENV_FILE` (a native host's saved settings, default
+`/etc/thinky-backup/env`), `THINKY_RESTORE_MARIADB_IMAGE`, `THINKY_RESTORE_POSTGRES_IMAGE`,
+`THINKY_RESTORE_PORTAINER_IMAGE`, and `TR_ROOT` (a prefix for every live path, used by the tests and
+for restoring onto a mounted disk).
+
+The image also ships the script as `/usr/local/bin/thinky-restore`. Setting `DRILL_RESTORE_APP` (for example
+`opt/prowlarr`) makes the restore drill run a `--dry-run` of the `app` command against the real repository, so
+the tool and the snapshot layout cannot drift apart unnoticed.
 
 ## Restoring a file
 

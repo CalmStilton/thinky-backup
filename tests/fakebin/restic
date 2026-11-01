@@ -1,0 +1,4 @@
+#!/bin/sh
+# Logs the arguments restic was started with, then runs the real restic.
+printf '%s\n' "$*" >> "$FAKE_DOCKER_DIR/restic.log"
+exec "$REAL_RESTIC" "$@"

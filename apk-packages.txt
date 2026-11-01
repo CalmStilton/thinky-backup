@@ -6,3 +6,4 @@ mariadb-client
 postgresql17-client
 tzdata
 ca-certificates
+bash

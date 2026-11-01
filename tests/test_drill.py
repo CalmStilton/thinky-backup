@@ -139,3 +139,51 @@ def test_wait_for_server_bails_when_process_exited(monkeypatch):
     monkeypatch.setattr(drill.subprocess, "run", lambda *a, **k: calls.append(a))
     assert drill._wait_for_server("/nope", 30, Dead()) is False
     assert calls == []
+
+
+FAKE_TOOL = """#!/bin/sh
+echo "$@" >> "$FAKE_TOOL_LOG"
+[ -n "$FAKE_TOOL_FAIL" ] && { echo "ERROR: $FAKE_TOOL_FAIL" >&2; exit 1; }
+exit 0
+"""
+
+
+def _fake_tool(tmp_path, monkeypatch, fail=""):
+    tool = tmp_path / "thinky-restore"
+    tool.write_text(FAKE_TOOL)
+    tool.chmod(0o755)
+    monkeypatch.setenv("FAKE_TOOL_LOG", str(tmp_path / "tool.log"))
+    monkeypatch.setenv("FAKE_TOOL_FAIL", fail)
+    monkeypatch.setenv("THINKY_RESTORE_BIN", str(tool))
+    return tmp_path / "tool.log"
+
+
+def test_restore_app_must_be_a_plain_name(make_cfg):
+    with pytest.raises(config.ConfigError, match="DRILL_RESTORE_APP"):
+        make_cfg(DRILL_RESTORE_APP="opt/../etc")
+    with pytest.raises(config.ConfigError, match="DRILL_RESTORE_APP"):
+        make_cfg(DRILL_RESTORE_APP="opt/a b")
+
+
+def test_drill_dry_runs_the_restore_tool(make_cfg, tmp_path, pushes, monkeypatch):
+    log = _fake_tool(tmp_path, monkeypatch)
+    cfg, restic = make_cfg(DRILL_RESTORE_APP="opt/prowlarr")
+    assert drill.drill(cfg, restic, push=pushes) == 0
+    assert pushes[-1] == ("http://kuma/d", True, "testhost/configs drill ok")
+    args = log.read_text().split()
+    assert args[:2] == ["app", "--host"] and "--dry-run" in args and "opt/prowlarr" in args
+
+
+def test_drill_reports_a_failing_restore_tool(make_cfg, tmp_path, pushes, monkeypatch):
+    _fake_tool(tmp_path, monkeypatch, fail="opt/prowlarr is not in that snapshot")
+    cfg, restic = make_cfg(DRILL_RESTORE_APP="opt/prowlarr")
+    assert drill.drill(cfg, restic, push=pushes) == 1
+    assert pushes[-1][1] is False and "failed (exit 1)" in pushes[-1][2]
+    assert "not in that snapshot" not in pushes[-1][2]
+
+
+def test_drill_reports_a_missing_restore_tool(make_cfg, tmp_path, pushes, monkeypatch):
+    monkeypatch.setenv("THINKY_RESTORE_BIN", str(tmp_path / "absent"))
+    cfg, restic = make_cfg(DRILL_RESTORE_APP="opt/prowlarr")
+    assert drill.drill(cfg, restic, push=pushes) == 1
+    assert pushes[-1][1] is False and "restore tool" in pushes[-1][2]

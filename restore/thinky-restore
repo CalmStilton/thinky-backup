@@ -1,0 +1,1100 @@
+#!/usr/bin/env bash
+# thinky-restore: guided restores from thinky-backup restic repositories.
+# It knows the snapshot layout (/src/opt, /src/vol, /scratch/sqlite), not any one site.
+# Secrets are read with `read -s` or taken from the environment. They go on only as
+# environment variables (docker -e NAME). They are never put on a command line,
+# written to disk or printed.
+set -uo pipefail
+case $- in *x*) echo "ERROR: refusing to run with xtrace on (it would print secrets)" >&2; exit 2 ;; esac
+
+TR_ROOT=${TR_ROOT:-}                       # prefix for every live path; empty on a real machine
+TR_STAGE_ROOT=${TR_STAGE_ROOT:-}           # where restored files are staged (local and image backends)
+TR_IMAGE=${THINKY_RESTORE_IMAGE:-ghcr.io/calmstilton/thinky-backup:latest}
+TR_FORCED_BACKEND=${TR_BACKEND:-}
+TR_FORCED_CONTAINER=
+TR_BACKEND=
+TR_CONTAINER=
+TR_HOST=
+TR_SNAP=
+TR_APP=
+TR_DB=
+TR_FILTER=
+TR_INTO=
+TR_KIND=
+TR_MAPFILE=${THINKY_RESTORE_MAP:-}
+TR_ALL=0
+TR_ASSUME_YES=0
+TR_DRY_RUN=0
+TR_SCRATCH=0
+TR_INTERACTIVE=0
+TR_STAGE_HOST=
+TR_STAGE_ARG=
+TR_STAGE_MOUNT=/restore
+TR_CRED_KIND=
+TR_SNAP_ID=
+TR_SNAP_WHEN=
+TR_LAST_ASIDE=
+TR_SCRATCH_CTR=
+TR_CLEANUP_DIRS=()
+TR_STOPPED=()
+TR_ASIDE_LIST=()
+TR_MAP_SRC=()
+TR_MAP_DST=()
+TR_DOCKER_ENV=()
+
+# ---- output and prompts -------------------------------------------------------
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  tr_abort_cleanup
+  exit 1
+}
+
+ask() {  # ask VAR "prompt" [default]   (the odd local names keep it from shadowing the caller's variable)
+  local __v=$1 __p=$2 __d=${3-} __a=''
+  if [ -n "$__d" ]; then printf '%s [%s]: ' "$__p" "$__d" >&2; else printf '%s: ' "$__p" >&2; fi
+  IFS= read -r __a || __a=''
+  printf -v "$__v" '%s' "${__a:-$__d}"
+}
+
+ask_secret() {  # ask_secret VAR "prompt" : keeps a value already in the environment; never echoes
+  local __v=$1 __p=$2 __a=''
+  if [ -n "${!__v:-}" ]; then export "${__v?}"; return 0; fi
+  printf '%s: ' "$__p" >&2
+  IFS= read -rs __a || __a=''
+  printf '\n' >&2
+  [ -n "$__a" ] || die "no value entered for: $__p"
+  printf -v "$__v" '%s' "$__a"
+  export "${__v?}"
+}
+
+confirm() {  # confirm "question" : true only if the user types exactly: yes
+  local q=$1 ans=
+  if [ "$TR_ASSUME_YES" = 1 ]; then say "$q yes (--yes)"; return 0; fi
+  printf '%s Type yes to continue: ' "$q" >&2
+  IFS= read -r ans || return 1
+  [ "$ans" = yes ]
+}
+
+tr_need() {  # tr_need VAR "prompt" : in the menu ask for a missing value, otherwise stop
+  local v=$1
+  [ -n "${!v}" ] && return 0
+  [ "$TR_INTERACTIVE" = 1 ] || die "missing option: ${v#TR_} (see --help)"
+  ask "$v" "$2"
+  [ -n "${!v}" ] || die "nothing entered"
+}
+
+tr_choose() {  # tr_choose VAR "prompt" ITEM... : numbered list; a number or the item text is accepted
+  local v=$1 p=$2 it ans='' i=1 n
+  shift 2
+  n=$#
+  [ "$n" -gt 0 ] || die "nothing to choose from"
+  for it in "$@"; do printf '  %d) %s\n' "$i" "$it" >&2; i=$((i + 1)); done
+  ask ans "$p" "${TR_CHOOSE_DEFAULT:-}"
+  if [[ $ans =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "$n" ]; then
+    printf -v "$v" '%s' "${!ans}"
+  else
+    printf -v "$v" '%s' "$ans"
+  fi
+}
+
+# ---- cleanup --------------------------------------------------------------------
+tr_cleanup_stage() {
+  local d
+  for d in ${TR_CLEANUP_DIRS[@]+"${TR_CLEANUP_DIRS[@]}"}; do rm -rf -- "$d"; done
+  TR_CLEANUP_DIRS=()
+  TR_STAGE_HOST=
+  if [ -n "$TR_SCRATCH_CTR" ] && command -v docker >/dev/null 2>&1; then
+    docker rm -fv "$TR_SCRATCH_CTR" >/dev/null 2>&1
+    TR_SCRATCH_CTR=
+  fi
+}
+
+tr_abort_cleanup() {  # on an error: restart what we stopped only if nothing was replaced yet
+  if [ "${#TR_STOPPED[@]}" -gt 0 ]; then
+    if [ "${#TR_ASIDE_LIST[@]}" -eq 0 ]; then
+      say "Starting the containers that were stopped: ${TR_STOPPED[*]}" >&2
+      docker start "${TR_STOPPED[@]}" >/dev/null 2>&1
+    else
+      warn "stopped containers were left stopped: ${TR_STOPPED[*]}. Something was already replaced; the old copy is kept next to it as *.before-restore-*."
+    fi
+    TR_STOPPED=()
+  fi
+  tr_cleanup_stage
+}
+
+tr_unset_creds() {
+  unset RESTIC_REPOSITORY RESTIC_PASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+    RCLONE_CONFIG_GDRIVE_TYPE RCLONE_CONFIG_GDRIVE_SCOPE RCLONE_CONFIG_GDRIVE_CLIENT_ID \
+    RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
+}
+
+tr_on_exit() { tr_abort_cleanup; tr_unset_creds; }
+trap tr_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+tr_need_root() {  # restores write to /opt, docker volumes and containers: they need root
+  if [ "$(id -u)" -ne 0 ] && [ -z "$TR_ROOT" ]; then die "run this with sudo, for example: sudo bash thinky-restore"; fi
+}
+
+tr_usage() {
+  cat <<'EOF'
+thinky-restore: bring things back from the Thinky backups.
+
+Run it with no arguments for the menu. For scripts and tests:
+
+  thinky-restore snapshots [--kind configs|media] [--host H] [--filter TEXT]
+  thinky-restore app   --host H --app NAME [--snapshot ID] [--dry-run] [--yes]
+  thinky-restore db    --host H --db bookstack|readmeabook [--snapshot ID] [--scratch] [--dry-run] [--yes]
+  thinky-restore host  --host H [--snapshot ID] [--dry-run] [--yes]
+  thinky-restore media [--host H] (--filter TEXT | --all) [--into DIR] [--yes]
+
+Other options: --backend local|exec|image, --container NAME, --map FILE, --stage DIR.
+
+Nothing is replaced without you typing yes, and whatever was there is moved aside to
+<path>.before-restore-YYYYmmdd-HHMM, never deleted. Passwords are asked for with no echo
+(or taken from the environment) and are never written anywhere.
+EOF
+}
+
+# ---- credentials ----------------------------------------------------------------
+tr_conf_get() {  # tr_conf_get KEY : a non-secret default from the optional conf file
+  local f=${THINKY_RESTORE_CONF:-/etc/thinky-restore.conf} line
+  [ -r "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in "$1="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+  done <"$f"
+  return 1
+}
+
+tr_show_repo() {  # print the repository without any user:password in it
+  printf '%s\n' "$RESTIC_REPOSITORY" | sed 's#//[^/@]*@#//#'
+}
+
+tr_default_repo() {  # tr_default_repo KEY : keep RESTIC_REPOSITORY, or take it from the conf file
+  local v
+  if [ -z "${RESTIC_REPOSITORY:-}" ]; then
+    v=$(tr_conf_get "$1") || return 1
+    RESTIC_REPOSITORY=$v
+  fi
+  export RESTIC_REPOSITORY
+  say "Repository: $(tr_show_repo)"
+}
+
+tr_ask_r2_repo() {
+  local ep='' bucket=''
+  ask ep "R2 S3 endpoint (card item 2)"
+  ask bucket "R2 bucket name (card item 2)"
+  [ -n "$ep" ] && [ -n "$bucket" ] || die "the endpoint and bucket name are on the break-glass card, item 2"
+  ep=${ep%/}
+  bucket=${bucket%% *}
+  RESTIC_REPOSITORY=s3:$ep/$bucket
+  export RESTIC_REPOSITORY
+  say "Repository: $(tr_show_repo)"
+}
+
+tr_offer_env_file() {  # a native host (such as AdGuard) keeps its settings in a root-only file
+  local f=${THINKY_RESTORE_ENV_FILE:-/etc/thinky-backup/env}
+  { [ -z "${RESTIC_PASSWORD:-}" ] && [ -r "$f" ]; } || return 0
+  if confirm "Found saved backup settings in $f. Use them?"; then
+    local line k v
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line#export }
+      line=${line%$'\r'}
+      case $line in *=*) ;; *) continue ;; esac
+      k=${line%%=*}
+      v=${line#*=}
+      case $k in
+        RESTIC_REPOSITORY | RESTIC_PASSWORD | AWS_ACCESS_KEY_ID | AWS_SECRET_ACCESS_KEY | RCLONE_CONFIG_GDRIVE_[A-Z_]*) ;;
+        *) continue ;;
+      esac
+      [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      case $v in
+        \"*\") v=${v#\"}; v=${v%\"} ;;
+        \'*\') v=${v#\'}; v=${v%\'} ;;
+      esac
+      printf -v "$k" '%s' "$v"
+      export "${k?}"
+    done <"$f"
+  fi
+}
+
+tr_credentials() {  # tr_credentials configs|media : fill in what restic needs. Prompts use the card's wording.
+  local kind=$1
+  if [ -n "$TR_CRED_KIND" ] && [ "$TR_CRED_KIND" != "$kind" ]; then tr_unset_creds; fi
+  TR_CRED_KIND=$kind
+  [ "$TR_BACKEND" = exec ] && return 0
+  case $kind in
+    configs)
+      tr_offer_env_file
+      tr_default_repo CONFIGS_REPOSITORY || tr_ask_r2_repo
+      ask_secret RESTIC_PASSWORD "Configs RESTIC_PASSWORD (card item 1)"
+      ask_secret AWS_ACCESS_KEY_ID "R2 Access Key ID (card item 2)"
+      ask_secret AWS_SECRET_ACCESS_KEY "R2 Secret Access Key (card item 2)"
+      TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY)
+      ;;
+    media)
+      if ! tr_default_repo MEDIA_REPOSITORY; then
+        ask RESTIC_REPOSITORY "Media repository" "rclone:gdrive:thinky-media"
+        export RESTIC_REPOSITORY
+      fi
+      ask_secret RESTIC_PASSWORD "Media RESTIC_PASSWORD (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_CLIENT_ID "Google Drive client ID (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_CLIENT_SECRET "Google Drive client secret (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_TOKEN "Google Drive token, the whole JSON (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID "Google Drive folder ID (card item 3)"
+      export RCLONE_CONFIG_GDRIVE_TYPE=drive RCLONE_CONFIG_GDRIVE_SCOPE=drive.file
+      TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD
+        -e RCLONE_CONFIG_GDRIVE_TYPE -e RCLONE_CONFIG_GDRIVE_SCOPE -e RCLONE_CONFIG_GDRIVE_CLIENT_ID
+        -e RCLONE_CONFIG_GDRIVE_CLIENT_SECRET -e RCLONE_CONFIG_GDRIVE_TOKEN -e RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID)
+      ;;
+    *) die "internal error: unknown repository kind '$kind'" ;;
+  esac
+}
+
+tr_adopt_env() {  # tr_adopt_env CONTAINER VAR... : copy variables out of a running container without printing them
+  local c=$1 v val
+  shift
+  for v in "$@"; do
+    val=$(docker exec "$c" sh -c "printf %s \"\$$v\"") || die "could not read $v from $c"
+    printf -v "$v" '%s' "$val"
+    export "${v?}"
+  done
+}
+
+# ---- where restic runs ---------------------------------------------------------
+tr_container_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$1"; }
+
+tr_select_backend() {  # tr_select_backend configs|media : exec (inside a backup container), local, or image
+  local kind=$1 c list
+  TR_BACKEND=$TR_FORCED_BACKEND
+  TR_CONTAINER=$TR_FORCED_CONTAINER
+  if [ -z "$TR_BACKEND" ]; then
+    if command -v docker >/dev/null 2>&1; then
+      if [ "$kind" = media ]; then
+        list=${THINKY_RESTORE_MEDIA_CONTAINERS:-backup-media}
+      else
+        list=${THINKY_RESTORE_CONFIGS_CONTAINERS:-backup-configs backup-frigate backup-alfiecodes}
+      fi
+      for c in $list; do
+        if tr_container_running "$c"; then TR_BACKEND='exec'; TR_CONTAINER=$c; break; fi
+      done
+    fi
+    if [ -z "$TR_BACKEND" ]; then
+      if command -v restic >/dev/null 2>&1; then
+        TR_BACKEND=local
+      elif command -v docker >/dev/null 2>&1; then
+        TR_BACKEND=image
+      else
+        die "this machine has neither restic nor docker"
+      fi
+    fi
+  fi
+  case $TR_BACKEND in
+    exec)
+      [ -n "$TR_CONTAINER" ] || die "--backend exec needs --container NAME"
+      say "Using the backup container $TR_CONTAINER: nothing to type."
+      ;;
+    local | image) ;;
+    *) die "unknown backend '$TR_BACKEND' (local, exec or image)" ;;
+  esac
+}
+
+tr_restic() {
+  case $TR_BACKEND in
+    local) restic "$@" ;;
+    exec) docker exec "$TR_CONTAINER" restic "$@" ;;
+    image)
+      if [ -n "$TR_STAGE_HOST" ]; then
+        docker run --rm --security-opt apparmor=unconfined --entrypoint restic \
+          ${TR_DOCKER_ENV[@]+"${TR_DOCKER_ENV[@]}"} -v "$TR_STAGE_HOST:$TR_STAGE_MOUNT" "$TR_IMAGE" "$@"
+      else
+        docker run --rm --security-opt apparmor=unconfined --entrypoint restic \
+          ${TR_DOCKER_ENV[@]+"${TR_DOCKER_ENV[@]}"} "$TR_IMAGE" "$@"
+      fi
+      ;;
+    *) die "internal error: no backend selected" ;;
+  esac
+}
+
+tr_open_stage() {  # makes a private staging folder; sets TR_STAGE_HOST (where we see it) and TR_STAGE_ARG (where restic sees it)
+  local id src base
+  id=thinky-restore-$(date +%Y%m%d-%H%M%S)-$$
+  case $TR_BACKEND in
+    exec)
+      src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/scratch"}}{{.Source}}{{end}}{{end}}' "$TR_CONTAINER") ||
+        die "cannot inspect $TR_CONTAINER"
+      [ -n "$src" ] || die "$TR_CONTAINER has no /scratch volume; use --backend image instead"
+      TR_STAGE_HOST=$src/$id
+      TR_STAGE_ARG=/scratch/$id
+      ;;
+    *)
+      base=${TR_STAGE_ROOT:-$TR_ROOT/var/tmp}
+      TR_STAGE_HOST=$base/$id
+      TR_STAGE_ARG=$TR_STAGE_HOST
+      if [ "$TR_BACKEND" = image ]; then TR_STAGE_ARG=$TR_STAGE_MOUNT; fi
+      ;;
+  esac
+  (umask 077 && mkdir -p -- "${TR_STAGE_HOST%/*}" && mkdir -- "$TR_STAGE_HOST") || die "cannot create $TR_STAGE_HOST (it must not already exist)"
+  TR_CLEANUP_DIRS+=("$TR_STAGE_HOST")
+}
+
+tr_close_stage() { tr_cleanup_stage; }
+
+tr_restore() {  # tr_restore SNAPSHOT_ID PATH... : fetch just these paths into the stage
+  local snap=$1 a=() p
+  shift
+  for p in "$@"; do a+=(--include "$(printf '%s' "$p" | sed 's/[][\\*?]/\\&/g')"); done
+  tr_restic restore "$snap" --target "$TR_STAGE_ARG" "${a[@]}" >/dev/null || die "restic could not restore from snapshot $snap"
+}
+
+# ---- looking at the backups -----------------------------------------------------
+tr_table() {  # tr_table TAG [HOST] -> lines: ID<TAB>YYYY-MM-DD HH:MM:SS<TAB>host<TAB>size, oldest first
+  local out args=(snapshots --compact --tag "$1")
+  [ -n "${2:-}" ] && args+=(--host "$2")
+  out=$(tr_restic "${args[@]}" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+  printf '%s\n' "$out" | awk '$1 ~ /^[0-9a-f]+$/ && $2 ~ /^[0-9][0-9][0-9][0-9]-/ {
+    s = ""; if (NF >= 7) s = $6 " " $7
+    printf "%s\t%s %s\t%s\t%s\n", $1, $2, $3, $4, s }'
+}
+
+tr_hosts() { tr_table "$1" | awk -F'\t' '{ print $3 }' | sort -u; }
+
+tr_pick_host() {  # tr_pick_host TAG : in the menu, ask which machine
+  local hosts=() h list
+  [ -n "$TR_HOST" ] && return 0
+  [ "$TR_INTERACTIVE" = 1 ] || return 0
+  list=$(tr_hosts "$1") || exit 1
+  while IFS= read -r h; do [ -n "$h" ] && hosts+=("$h"); done <<<"$list"
+  [ "${#hosts[@]}" -gt 0 ] || die "no backups found in this repository"
+  tr_choose TR_HOST "Which machine?" "${hosts[@]}"
+}
+
+tr_resolve_snapshot() {  # tr_resolve_snapshot TAG : sets TR_SNAP_ID and TR_SNAP_WHEN from --snapshot (default latest)
+  local want=${TR_SNAP:-latest} list line rest
+  list=$(tr_table "$1" "$TR_HOST") || exit 1
+  [ -n "$list" ] || die "no '$1' snapshots found for host '$TR_HOST' (option 5 lists what exists)"
+  if [ "$want" = latest ]; then
+    line=$(printf '%s\n' "$list" | tail -n 1)
+  else
+    line=$(printf '%s\n' "$list" | awk -F'\t' -v w="$want" 'index($1, w) == 1 { print; exit }')
+  fi
+  [ -n "$line" ] || die "snapshot '$want' not found for host '$TR_HOST'"
+  TR_SNAP_ID=${line%%$'\t'*}
+  rest=${line#*$'\t'}
+  TR_SNAP_WHEN=${rest%%$'\t'*}
+}
+
+tr_pick_snapshot() {  # tr_pick_snapshot TAG : in the menu offer the recent snapshots, otherwise use --snapshot or the newest
+  local list line items=() choice
+  if [ -z "$TR_SNAP" ] && [ "$TR_INTERACTIVE" = 1 ]; then
+    list=$(tr_table "$1" "$TR_HOST") || exit 1
+    [ -n "$list" ] || die "no '$1' snapshots found for host '$TR_HOST'"
+    while IFS= read -r line; do
+      items=("$(printf '%s' "$line" | awk -F'\t' '{ printf "%s  %s  %s", $1, $2, $4 }')" ${items[@]+"${items[@]}"})
+    done <<<"$list"
+    say "Which backup? The newest is first."
+    TR_CHOOSE_DEFAULT=1 tr_choose choice "Enter a number" "${items[@]:0:15}"
+    TR_SNAP=${choice%% *}
+  fi
+  tr_resolve_snapshot "$1"
+}
+
+tr_children() {  # tr_children SNAPSHOT DIR -> names of the entries directly inside DIR
+  tr_restic ls "$1" "$2" 2>/dev/null | awk -v d="$2" '
+    index($0, d "/") == 1 { n = substr($0, length(d) + 2); if (n != "" && index(n, "/") == 0) print n }'
+}
+
+tr_cmd_snapshots() {
+  local kind=${TR_KIND:-configs} hosts h
+  tr_select_backend "$kind"
+  tr_credentials "$kind"
+  if [ -n "$TR_HOST" ]; then hosts=$TR_HOST; else hosts=$(tr_hosts "$kind") || exit 1; fi
+  [ -n "$hosts" ] || die "no '$kind' backups found"
+  while IFS= read -r h; do
+    say "Machine: $h"
+    TR_HOST=$h
+    tr_table "$kind" "$h" | while IFS=$'\t' read -r id when _ size; do
+      printf '  %s  %s  %s\n' "$id" "$when" "$size"
+    done
+    if [ -n "$TR_FILTER" ]; then
+      tr_resolve_snapshot "$kind"
+      say "  Files matching '$TR_FILTER' in the newest backup ($TR_SNAP_ID):"
+      tr_restic ls "$TR_SNAP_ID" 2>/dev/null | grep -iF -- "$TR_FILTER" | head -n 50 | sed 's/^/    /'
+    fi
+  done <<<"$hosts"
+}
+
+# ---- snapshot paths <-> live paths -------------------------------------------------
+tr_load_map() {  # tr_load_map FILE : lines "/snapshot/path=/live/path"; # starts a comment
+  local f=$1 line k v
+  [ -r "$f" ] || die "cannot read the map file $f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in '' | '#'*) continue ;; esac
+    k=${line%%=*}
+    v=${line#*=}
+    case "$k$v" in *..*) die "map $f: '..' is not allowed: $line" ;; esac
+    { [ "${k#/}" != "$k" ] && [ "${v#/}" != "$v" ]; } || die "map $f: both sides must be absolute paths: $line"
+    TR_MAP_SRC+=("${k%/}")
+    TR_MAP_DST+=("${v%/}")
+  done <"$f"
+}
+
+tr_live_for() {  # tr_live_for SNAPSHOT_PATH -> where it lives on a real machine (without TR_ROOT)
+  local p=$1 r name i k
+  case $p in */../* | */.. | .. | ../*) echo "refusing a path with '..': $p" >&2; return 1 ;; esac
+  case $p in
+    /src/opt/*) printf '/opt/%s\n' "${p#/src/opt/}"; return 0 ;;
+    /src/vol/*)
+      r=${p#/src/vol/}
+      name=${r%%/*}
+      printf '/var/lib/docker/volumes/%s/_data%s\n' "$name" "${r#"$name"}"
+      return 0
+      ;;
+  esac
+  for i in "${!TR_MAP_SRC[@]}"; do
+    k=${TR_MAP_SRC[$i]}
+    case $p in
+      "$k") printf '%s\n' "${TR_MAP_DST[$i]}"; return 0 ;;
+      "$k"/*) printf '%s%s\n' "${TR_MAP_DST[$i]}" "${p#"$k"}"; return 0 ;;
+    esac
+  done
+  case $p in
+    /src/* | /scratch/*) return 1 ;;
+    /?*) printf '%s\n' "$p" ;;     # a native host: snapshot paths are the real paths
+    *) return 1 ;;
+  esac
+}
+
+tr_ask_unmapped() {  # tr_ask_unmapped SNAPSHOT_PATH : in the menu, ask where an unmapped folder belongs (for this run only)
+  local p=$1 dest=''
+  [ "$TR_INTERACTIVE" = 1 ] || return 1
+  ask dest "Where on this machine should $p go? Full path, or press Enter to skip it"
+  [ -n "$dest" ] || return 1
+  case $dest in
+    *..*) warn "'..' is not allowed"; return 1 ;;
+    /?*) ;;
+    *) warn "that is not a full path"; return 1 ;;
+  esac
+  TR_MAP_SRC+=("${p%/}")
+  TR_MAP_DST+=("${dest%/}")
+}
+
+tr_load_default_map() {
+  local here
+  if [ -n "$TR_MAPFILE" ]; then tr_load_map "$TR_MAPFILE"; return; fi
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || return 0
+  if [ -r "$here/thinky-stack.map" ]; then tr_load_map "$here/thinky-stack.map"; fi
+}
+
+# ---- putting files back ----------------------------------------------------------------
+tr_mkdir() { ( umask 022 && mkdir -p -- "$1" ); }   # parents get normal permissions whatever umask the caller has
+
+tr_move_aside() {  # tr_move_aside LIVE : rename it to LIVE.before-restore-STAMP; sets TR_LAST_ASIDE (empty if nothing was there)
+  local live=$1 stamp aside n=0
+  TR_LAST_ASIDE=
+  if [ ! -e "$live" ] && [ ! -L "$live" ]; then return 0; fi
+  stamp=$(date +%Y%m%d-%H%M)
+  aside=$live.before-restore-$stamp
+  while [ -e "$aside" ]; do n=$((n + 1)); aside=$live.before-restore-$stamp-$n; done
+  mv -- "$live" "$aside" || die "could not move $live aside"
+  TR_LAST_ASIDE=$aside
+  TR_ASIDE_LIST+=("$live"$'\t'"$aside")
+}
+
+tr_old_copy_of() {  # where a live path's previous version was moved to, if it was
+  local pair live aside
+  for pair in ${TR_ASIDE_LIST[@]+"${TR_ASIDE_LIST[@]}"}; do
+    live=${pair%%$'\t'*}
+    aside=${pair#*$'\t'}
+    case $1 in "$live"/*) printf '%s%s\n' "$aside" "${1#"$live"}"; return 0 ;; esac
+  done
+  return 0
+}
+
+tr_ensure_volume() {  # tr_ensure_volume NAME : a docker volume must exist before its folder can be filled
+  local name=${1%%/*}
+  [ -d "$TR_ROOT/var/lib/docker/volumes/$name/_data" ] && return 0
+  docker volume create "$name" >/dev/null || die "could not create the docker volume $name"
+}
+
+tr_place_unit() {  # tr_place_unit SNAPSHOT_PATH : staged copy -> live path, old copy moved aside
+  local unit=$1 real live
+  real=$(tr_live_for "$unit") || { warn "no live path known for $unit; skipped"; return 1; }
+  live=$TR_ROOT$real
+  [ -e "$TR_STAGE_HOST$unit" ] || { warn "$unit is not in the snapshot; skipped"; return 1; }
+  case $unit in /src/vol/*) tr_ensure_volume "${unit#/src/vol/}" ;; esac
+  if [ -d "$live" ] && [ -z "$(ls -A -- "$live" 2>/dev/null)" ]; then rmdir -- "$live"; fi
+  tr_move_aside "$live"
+  tr_mkdir "${live%/*}" || die "cannot create ${live%/*}"
+  cp -a -- "$TR_STAGE_HOST$unit" "$live" ||
+    die "copying to $live failed. The previous copy is at ${TR_LAST_ASIDE:-(nothing was there)}"
+}
+
+tr_overlay_sqlite() {  # tr_overlay_sqlite [SNAPSHOT_PATH_PREFIX] : clean SQLite copies from the snapshot over their live files
+  local root=$TR_STAGE_HOST/scratch/sqlite prefix=${1:-} f orig real live ref uid mode
+  TR_OVERLAID=0
+  if [ ! -e "$root$prefix" ]; then return 0; fi
+  while IFS= read -r -d '' f; do
+    orig=${f#"$root"}
+    real=$(tr_live_for "$orig") || { warn "no live path for the database copy $orig; skipped"; continue; }
+    live=$TR_ROOT$real
+    ref=$(tr_old_copy_of "$live")
+    if [ -z "$ref" ] || [ ! -e "$ref" ]; then ref=${live%/*}; fi
+    tr_mkdir "${live%/*}"
+    rm -f -- "$live" "$live-wal" "$live-shm"
+    cp -- "$f" "$live" || die "could not write $live"
+    uid=$(stat -c '%u:%g' -- "$ref")
+    chown "$uid" -- "$live"
+    if [ -f "$ref" ]; then mode=$(stat -c '%a' -- "$ref"); chmod "$mode" -- "$live"; fi
+    TR_OVERLAID=$((TR_OVERLAID + 1))
+  done < <(find "$root$prefix" -type f -print0)
+}
+
+# ---- option 1: restore one app ---------------------------------------------------------
+tr_resolve_unit() {  # tr_resolve_unit NAME -> its snapshot path: opt/NAME, vol/NAME or an absolute path
+  local name=$1 o v
+  case $name in
+    /*) printf '%s\n' "$name"; return 0 ;;
+    opt/* | vol/*) printf '/src/%s\n' "$name"; return 0 ;;
+  esac
+  o=$(tr_children "$TR_SNAP_ID" /src/opt | grep -Fx -- "$name" || true)
+  v=$(tr_children "$TR_SNAP_ID" /src/vol | grep -Fx -- "$name" || true)
+  if [ -n "$o" ] && [ -n "$v" ]; then die "'$name' is both an app folder and a volume: say opt/$name or vol/$name"; fi
+  if [ -n "$o" ]; then printf '/src/opt/%s\n' "$name"
+  elif [ -n "$v" ]; then printf '/src/vol/%s\n' "$name"
+  else die "no app called '$name' in snapshot $TR_SNAP_ID (option 5 lists what is there)"; fi
+}
+
+tr_pick_app() {  # in the menu: list the apps in the chosen snapshot
+  local names=() n list
+  list=$( (tr_children "$TR_SNAP_ID" /src/opt | sed 's#^#opt/#'; tr_children "$TR_SNAP_ID" /src/vol | sed 's#^#vol/#') )
+  while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done <<<"$list"
+  [ "${#names[@]}" -gt 0 ] || die "that snapshot has no apps in the usual places; try option 3 for a native host"
+  tr_choose TR_APP "Which app? (number or name)" "${names[@]}"
+}
+
+tr_containers_using() {  # tr_containers_using NAME PATH : running containers called NAME or with a mount at or under PATH
+  local n s
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ "$n" = "$1" ]; then printf '%s\n' "$n"; continue; fi
+    while IFS= read -r s; do
+      case $s in "$2" | "$2"/*) printf '%s\n' "$n"; break ;; esac
+    done < <(docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$n" 2>/dev/null)
+  done < <(docker ps --format '{{.Names}}')
+}
+
+tr_start_stopped() {
+  if [ "${#TR_STOPPED[@]}" -gt 0 ]; then
+    docker start "${TR_STOPPED[@]}" >/dev/null || warn "could not start: ${TR_STOPPED[*]}"
+    TR_STOPPED=()
+  fi
+}
+
+tr_cmd_app() {
+  local unit real live c containers=() cont_list="none" replaced
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+  if [ -z "$TR_APP" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_pick_app; fi
+  tr_need TR_APP "Which app"
+  unit=$(tr_resolve_unit "$TR_APP") || exit 1
+  real=$(tr_live_for "$unit") || { tr_ask_unmapped "$unit" && real=$(tr_live_for "$unit"); } ||
+    die "do not know where $unit lives on this machine (see --map)"
+  live=$TR_ROOT$real
+
+  tr_open_stage
+  say "Fetching $unit from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN, machine $TR_HOST) ..."
+  tr_restore "$TR_SNAP_ID" "$unit" "/scratch/sqlite$unit"
+  [ -e "$TR_STAGE_HOST$unit" ] || die "$unit is not in that snapshot"
+
+  while IFS= read -r c; do [ -n "$c" ] && containers+=("$c"); done < <(tr_containers_using "${unit##*/}" "$real")
+  if [ "${#containers[@]}" -gt 0 ]; then cont_list=${containers[*]}; fi
+  replaced="nothing there yet"
+  if [ -e "$live" ]; then replaced="exists; it will be moved aside, not deleted"; fi
+  say ""
+  say "About to restore:"
+  say "  from:        snapshot $TR_SNAP_ID, taken $TR_SNAP_WHEN, machine $TR_HOST"
+  say "  to:          $live ($replaced)"
+  say "  databases:   $(find "$TR_STAGE_HOST/scratch/sqlite$unit" -type f 2>/dev/null | wc -l | tr -d ' ') SQLite copy/copies from the snapshot replace the live ones"
+  say "  stops:       $cont_list (and starts them again afterwards)"
+  say "  this is:     $(hostname)"
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: nothing on this machine was changed."
+    tr_close_stage
+    return 0
+  fi
+  confirm "Replace $live with the backup?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+
+  if [ "${#containers[@]}" -gt 0 ]; then
+    TR_STOPPED=("${containers[@]}")
+    docker stop "${containers[@]}" >/dev/null || die "could not stop ${containers[*]}"
+  fi
+  tr_place_unit "$unit" || die "nothing was restored"
+  tr_overlay_sqlite "$unit"
+  tr_start_stopped
+  tr_close_stage
+
+  say ""
+  say "Done: $live is back as of $TR_SNAP_WHEN."
+  if [ -n "$TR_LAST_ASIDE" ]; then
+    say "The copy that was there is kept at: $TR_LAST_ASIDE"
+    say "To undo: ${containers[*]:+docker stop ${containers[*]}; }mv '$live' '$live.rejected'; mv '$TR_LAST_ASIDE' '$live'${containers[*]:+; docker start ${containers[*]}}"
+    say "When you are happy with it, delete the old copy yourself."
+  fi
+}
+
+# ---- option 2: restore a database ------------------------------------------------------
+tr_db_define() {  # tr_db_define NAME : sets the TR_DB_* facts for a known database
+  case $1 in
+    bookstack)
+      TR_DB_KIND=mariadb
+      TR_DB_CONTAINER=bookstack_db
+      TR_DB_NAME=bookstackapp
+      TR_DB_DUMP=/src/opt/bookstack/db/backups/bookstack-nightly.sql.gz
+      TR_DB_HOSTDIR=/opt/bookstack/db/backups
+      TR_DB_CTRDIR=
+      TR_DB_TABLE=entities
+      ;;
+    readmeabook)
+      TR_DB_KIND=postgres
+      TR_DB_CONTAINER=readmeabook
+      TR_DB_NAME=readmeabook
+      TR_DB_DUMP=/src/opt/readmeabook/config/backups/readmeabook-nightly.dump
+      TR_DB_HOSTDIR=/opt/readmeabook/config/backups
+      TR_DB_CTRDIR=/app/config/backups
+      TR_DB_TABLE=
+      ;;
+    *) die "unknown database '$1' (bookstack or readmeabook)" ;;
+  esac
+}
+
+tr_wait_ready() {  # tr_wait_ready CONTAINER PATTERN : official images start a temporary server first, so wait for the second "ready"
+  local c=$1 pat=$2 tries=0
+  until [ "$(docker logs "$c" 2>&1 | grep -c -- "$pat")" -ge 2 ]; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 90 ] || die "the scratch database did not start"
+    sleep 2
+  done
+}
+
+tr_db_scratch() {  # tr_db_scratch DUMPFILE : load the dump into a throwaway container with no network; live data is untouched
+  local dump=$1 name=thinky-restore-scratch-$$ image count
+  TR_SCRATCH_CTR=$name
+  if [ "$TR_DB_KIND" = mariadb ]; then
+    image=${THINKY_RESTORE_MARIADB_IMAGE:-mariadb:11}
+    docker run -d --name "$name" --network none -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 \
+      -e MARIADB_DATABASE="$TR_DB_NAME" "$image" >/dev/null || die "could not start the scratch database"
+    tr_wait_ready "$name" 'ready for connections'
+    gzip -dc -- "$dump" | docker exec -i "$name" mariadb -u root "$TR_DB_NAME" || die "loading the dump into the scratch database failed"
+    count=$(docker exec "$name" mariadb -N -B -u root -e "SELECT COUNT(*) FROM $TR_DB_NAME.$TR_DB_TABLE") || die "could not count rows"
+    say "Scratch check: the dump loads, and table $TR_DB_TABLE has $count rows."
+  else
+    image=${THINKY_RESTORE_POSTGRES_IMAGE:-postgres:17}
+    docker run -d --name "$name" --network none -e POSTGRES_HOST_AUTH_METHOD=trust \
+      -e POSTGRES_DB="$TR_DB_NAME" "$image" >/dev/null || die "could not start the scratch database"
+    tr_wait_ready "$name" 'ready to accept connections'
+    docker exec -i "$name" pg_restore --no-owner -U postgres -d "$TR_DB_NAME" <"$dump" ||
+      warn "pg_restore reported problems (some are normal for a dump made by another role)"
+    count=$(docker exec "$name" psql -U postgres -d "$TR_DB_NAME" -At \
+      -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'") || die "could not count tables"
+    say "Scratch check: the dump loads, and the database has $count tables."
+  fi
+  docker rm -fv "$name" >/dev/null 2>&1
+  TR_SCRATCH_CTR=
+}
+
+tr_db_live() {  # tr_db_live DUMPFILE : save the current database, then load the dump into the running one
+  local dump=$1 stamp pre hostdir count
+  stamp=$(date +%Y%m%d-%H%M%S)
+  hostdir=$TR_ROOT$TR_DB_HOSTDIR
+  tr_mkdir "$hostdir" || die "cannot create $hostdir"
+  if [ "$TR_DB_KIND" = mariadb ]; then
+    pre=$hostdir/bookstack-before-restore-$stamp.sql.gz
+    say "Saving the current database to $pre first ..."
+    if ! (umask 077 && docker exec "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb-dump --no-tablespaces -u $MYSQL_USER '"$TR_DB_NAME" | gzip >"$pre"); then
+      die "could not save the current database, so nothing was changed"
+    fi
+    say "Loading the backup ..."
+    gzip -dc -- "$dump" | docker exec -i "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb -u $MYSQL_USER '"$TR_DB_NAME" ||
+      die "loading failed. The database may be half loaded; the saved copy is $pre"
+    count=$(docker exec "$TR_DB_CONTAINER" sh -c \
+      'MYSQL_PWD=$MYSQL_PASSWORD mariadb -N -B -u $MYSQL_USER '"$TR_DB_NAME"' -e "SELECT COUNT(*) FROM '"$TR_DB_TABLE"'"') ||
+      die "loaded, but could not count the rows"
+    say "Done: table $TR_DB_TABLE now has $count rows. The previous database is saved at $pre"
+  else
+    pre=readmeabook-before-restore-$stamp.dump
+    say "Saving the current database to $hostdir/$pre first ..."
+    docker exec -u postgres "$TR_DB_CONTAINER" pg_dump -Fc -f "$TR_DB_CTRDIR/$pre" "$TR_DB_NAME" ||
+      die "could not save the current database, so nothing was changed"
+    cp -- "$dump" "$hostdir/readmeabook-restored-$stamp.dump" || die "could not copy the dump into $hostdir"
+    chmod 644 "$hostdir/readmeabook-restored-$stamp.dump" || die "could not make the copied dump readable"
+    say "Loading the backup ..."
+    if docker exec -u postgres "$TR_DB_CONTAINER" pg_restore --clean --if-exists -d "$TR_DB_NAME" \
+      "$TR_DB_CTRDIR/readmeabook-restored-$stamp.dump"; then
+      say "Done. The previous database is saved at $hostdir/$pre"
+    else
+      warn "pg_restore finished with messages (above). Check the app. The previous database is saved at $hostdir/$pre"
+    fi
+  fi
+}
+
+tr_cmd_db() {
+  local dump
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+  if [ -z "$TR_DB" ] && [ "$TR_INTERACTIVE" = 1 ]; then tr_choose TR_DB "Which database?" bookstack readmeabook; fi
+  tr_need TR_DB "Which database (bookstack or readmeabook)"
+  tr_db_define "$TR_DB"
+
+  tr_open_stage
+  say "Fetching the $TR_DB dump from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) ..."
+  tr_restore "$TR_SNAP_ID" "$TR_DB_DUMP"
+  dump=$TR_STAGE_HOST$TR_DB_DUMP
+  [ -s "$dump" ] || die "the dump is not in that snapshot ($TR_DB_DUMP)"
+  if [ "$TR_DB_KIND" = mariadb ]; then gzip -t -- "$dump" || die "the dump is damaged (gzip test failed)"; fi
+
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: the $TR_DB dump from $TR_SNAP_WHEN was fetched and looks intact. Nothing was loaded."
+    tr_close_stage
+    return 0
+  fi
+  if [ "$TR_SCRATCH" = 1 ]; then
+    tr_db_scratch "$dump"
+    tr_close_stage
+    return 0
+  fi
+  say ""
+  say "About to replace the tables of the running $TR_DB database ($TR_DB_CONTAINER) with the dump taken $TR_SNAP_WHEN."
+  say "The current database is saved first, beside the dumps."
+  confirm "Load the $TR_DB backup into the live database?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+  tr_db_live "$dump"
+  tr_close_stage
+}
+
+# ---- option 3: rebuild a whole machine ---------------------------------------------------
+tr_ls_a() { ls -A -- "$1" 2>/dev/null; }
+
+tr_stage_units() {  # snapshot paths of everything in the stage that can be put back; unmapped /src/* are reported on stderr
+  local n top sub k covered any exact
+  if [ -d "$TR_STAGE_HOST/src/opt" ]; then
+    while IFS= read -r n; do printf '/src/opt/%s\n' "$n"; done < <(tr_ls_a "$TR_STAGE_HOST/src/opt")
+  fi
+  if [ -d "$TR_STAGE_HOST/src/vol" ]; then
+    while IFS= read -r n; do printf '/src/vol/%s\n' "$n"; done < <(tr_ls_a "$TR_STAGE_HOST/src/vol")
+  fi
+  for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+    if [ -e "$TR_STAGE_HOST$k" ]; then printf '%s\n' "$k"; fi
+  done
+  if [ -d "$TR_STAGE_HOST/src" ]; then
+    while IFS= read -r top; do
+      case $top in opt | vol) continue ;; esac
+      any=0 exact=0
+      for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+        case $k in
+          "/src/$top") exact=1; any=1 ;;
+          "/src/$top"/*) any=1 ;;
+        esac
+      done
+      if [ "$any" = 0 ]; then
+        echo "UNMAPPED /src/$top" >&2
+      elif [ "$exact" = 0 ]; then   # some of it is mapped: report each sibling that is not
+        while IFS= read -r sub; do
+          covered=0
+          for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+            case $k in "/src/$top/$sub" | "/src/$top/$sub"/*) covered=1 ;; esac
+          done
+          if [ "$covered" = 0 ]; then echo "UNMAPPED /src/$top/$sub" >&2; fi
+        done < <(tr_ls_a "$TR_STAGE_HOST/src/$top")
+      fi
+    done < <(tr_ls_a "$TR_STAGE_HOST/src")
+  fi
+  while IFS= read -r top; do   # a native host: real paths, two levels down (for example /opt/AdGuardHome)
+    case $top in src | scratch) continue ;; esac
+    while IFS= read -r sub; do printf '/%s/%s\n' "$top" "$sub"; done < <(tr_ls_a "$TR_STAGE_HOST/$top")
+  done < <(tr_ls_a "$TR_STAGE_HOST")
+}
+
+tr_collect_units() {  # fills the global array TR_UNITS from the stage
+  local u
+  TR_UNITS=()
+  while IFS= read -r -u 3 u; do   # fd 3, so the prompt below still reads the keyboard
+    case $u in
+      UNMAPPED*)
+        if tr_ask_unmapped "${u#UNMAPPED }"; then
+          TR_UNITS+=("${u#UNMAPPED }")
+        else
+          warn "${u#UNMAPPED } has no known live path and will be left in the staging folder (see --map)"
+          TR_KEEP_STAGE=1
+        fi
+        ;;
+      *) TR_UNITS+=("$u") ;;
+    esac
+  done 3< <(tr_stage_units 2>&1)
+}
+
+tr_place_all() {  # put every unit in TR_UNITS back, then the SQLite copies
+  local u placed=0
+  for u in "${TR_UNITS[@]}"; do
+    if tr_place_unit "$u"; then placed=$((placed + 1)); say "  restored $u"; else TR_KEEP_STAGE=1; fi
+  done
+  tr_overlay_sqlite ""
+  say "Put back $placed item(s) and $TR_OVERLAID database cop(ies)."
+}
+
+tr_cmd_host() {
+  local u real live note portainer_image
+  TR_KEEP_STAGE=0
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+
+  tr_open_stage
+  say "Fetching everything for $TR_HOST from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) into $TR_STAGE_HOST"
+  say "Free space there: $(df -h -- "${TR_STAGE_HOST%/*}" | awk 'NR == 2 { print $4 }'). Use --stage DIR to stage on a bigger disk."
+  tr_restic restore "$TR_SNAP_ID" --target "$TR_STAGE_ARG" >/dev/null || die "restic could not restore snapshot $TR_SNAP_ID"
+  tr_collect_units
+  [ "${#TR_UNITS[@]}" -gt 0 ] || die "that snapshot holds nothing this tool knows how to put back"
+
+  say ""
+  say "This will put the following on THIS machine ($(hostname)):"
+  for u in "${TR_UNITS[@]}"; do
+    real=$(tr_live_for "$u") || continue
+    live=$TR_ROOT$real
+    note="new"
+    if [ -e "$live" ] && [ -n "$(ls -A -- "$live" 2>/dev/null || echo file)" ]; then note="exists, will be moved aside"; fi
+    say "  $u -> $live ($note)"
+  done
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: nothing on this machine was changed."
+    tr_close_stage
+    return 0
+  fi
+  confirm "Restore all of this from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) onto this machine?" ||
+    { tr_close_stage; die "not confirmed; nothing was changed"; }
+
+  tr_place_all
+  if printf '%s\n' "${TR_UNITS[@]}" | grep -Fxq /src/vol/portainer_data && command -v docker >/dev/null 2>&1; then
+    portainer_image=${THINKY_RESTORE_PORTAINER_IMAGE:-portainer/portainer-ce:lts}
+    if confirm "Start Portainer now from the restored data ($portainer_image)?"; then
+      docker run -d --name portainer --restart=always -p 9000:9000 -p 9443:9443 \
+        -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data "$portainer_image" >/dev/null ||
+        warn "could not start Portainer (is one already running?)"
+    fi
+    say ""
+    say "Next: open Portainer on port 9000, go to Stacks, and start each stack. The stack numbers saved are:"
+    say "  $(tr_ls_a "$TR_ROOT/var/lib/docker/volumes/portainer_data/_data/compose" | tr '\n' ' ')"
+    say "Once the stacks are up, run this tool again and choose option 2 for BookStack and for ReadMeABook."
+  fi
+  if [ "$TR_KEEP_STAGE" = 1 ]; then
+    TR_CLEANUP_DIRS=()
+    say "Some items were not put back. They are still in $TR_STAGE_HOST (delete it when you are finished)."
+  else
+    tr_close_stage
+  fi
+}
+
+# ---- option 4: ebooks and audiobooks ---------------------------------------------------
+tr_media_matches() {  # tr_media_matches SNAPSHOT TEXT -> folders (author or title level) whose path contains TEXT
+  tr_restic ls "$1" 2>/dev/null | awk -v f="$2" '
+    BEGIN { f = tolower(f) }
+    substr($0, 1, 5) == "/src/" && index(tolower($0), f) {
+      n = split($0, p, "/")
+      if (n < 4) next
+      k = (n > 5 ? 5 : n)
+      s = ""
+      for (i = 2; i <= k; i++) s = s "/" p[i]
+      print s
+    }' | sort -u
+}
+
+tr_cmd_media() {
+  local matches=() list m picked sel stamp dest rel n
+  TR_KEEP_STAGE=0
+  tr_load_default_map
+  tr_select_backend media
+  if [ "$TR_ALL" = 1 ] && [ "$TR_BACKEND" = exec ]; then
+    # a full restore is tens of GB: do not fill the container's scratch volume
+    say "A full restore needs a big disk, so it runs in a one-off container instead of $TR_CONTAINER."
+    tr_adopt_env "$TR_CONTAINER" RESTIC_REPOSITORY RESTIC_PASSWORD RCLONE_CONFIG_GDRIVE_TYPE RCLONE_CONFIG_GDRIVE_SCOPE \
+      RCLONE_CONFIG_GDRIVE_CLIENT_ID RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID
+    TR_CRED_KIND=media
+    TR_BACKEND=image
+    TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD
+      -e RCLONE_CONFIG_GDRIVE_TYPE -e RCLONE_CONFIG_GDRIVE_SCOPE -e RCLONE_CONFIG_GDRIVE_CLIENT_ID
+      -e RCLONE_CONFIG_GDRIVE_CLIENT_SECRET -e RCLONE_CONFIG_GDRIVE_TOKEN -e RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID)
+  else
+    tr_credentials media
+  fi
+  if [ -z "$TR_HOST" ]; then
+    list=$(tr_hosts media) || exit 1
+    [ -n "$list" ] || die "no media backups found"
+    if [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ]; then TR_HOST=$list; else tr_pick_host media; fi
+  fi
+  tr_need TR_HOST "Which machine's media backup (host name)"
+  tr_pick_snapshot media
+  stamp=$(date +%Y%m%d-%H%M)
+
+  if [ "$TR_ALL" = 1 ]; then
+    tr_need TR_INTO "A folder on a disk with enough space (the files are staged there first)"
+    TR_STAGE_ROOT=$TR_INTO
+    tr_open_stage
+    say "Restoring everything from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) into $TR_STAGE_HOST. This can take an hour or more."
+    confirm "Start the full restore?" || { tr_close_stage; die "not confirmed; nothing was changed"; }
+    tr_restic restore "$TR_SNAP_ID" --target "$TR_STAGE_ARG" >/dev/null || die "restic could not restore snapshot $TR_SNAP_ID"
+    tr_collect_units
+    tr_place_all
+    if [ "$TR_KEEP_STAGE" = 1 ]; then
+      TR_CLEANUP_DIRS=()
+      say "Some items were not put back. They are still in $TR_STAGE_HOST."
+    else
+      tr_close_stage
+    fi
+    return 0
+  fi
+
+  tr_need TR_FILTER "Part of the title or author to look for"
+  list=$(tr_media_matches "$TR_SNAP_ID" "$TR_FILTER") || exit 1
+  while IFS= read -r m; do [ -n "$m" ] && matches+=("$m"); done <<<"$list"
+  [ "${#matches[@]}" -gt 0 ] || die "nothing in snapshot $TR_SNAP_ID matches '$TR_FILTER'"
+  say "Found ${#matches[@]} match(es):"
+  n=1
+  for m in "${matches[@]:0:30}"; do printf '  %d) %s\n' "$n" "$m"; n=$((n + 1)); done
+  picked=("${matches[@]}")
+  if [ "$TR_INTERACTIVE" = 1 ]; then
+    ask sel "Which ones? Numbers separated by spaces, or all" all
+    if [ "$sel" != all ]; then
+      picked=()
+      for n in $sel; do
+        if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#matches[@]}" ]; then picked+=("${matches[$((n - 1))]}"); fi
+      done
+      [ "${#picked[@]}" -gt 0 ] || die "nothing chosen"
+    fi
+  fi
+  if [ -z "$TR_INTO" ]; then
+    if [ "$TR_INTERACTIVE" = 1 ]; then ask TR_INTO "Folder to put the restored files in" "$PWD/restored-$stamp"; else TR_INTO=$PWD/restored-$stamp; fi
+  fi
+
+  tr_open_stage
+  tr_restore "$TR_SNAP_ID" "${picked[@]}"
+  for m in "${picked[@]}"; do
+    rel=${m#/src/}
+    dest=$TR_INTO/$rel
+    mkdir -p -- "${dest%/*}"
+    cp -a -n -- "$TR_STAGE_HOST$m" "${dest%/*}/" || warn "could not copy $m"
+  done
+  tr_close_stage
+  say "Copied ${#picked[@]} item(s) into $TR_INTO. Files that were already there were kept. Nothing in your library was changed."
+  say "To add a book back to Calibre use Add books; for audiobooks copy the folder into the audiobooks share."
+}
+
+# ---- the menu ------------------------------------------------------------------------------
+tr_menu_item() {  # tr_menu_item KIND COMMAND : ask for the passwords here (so they are kept), then run in a subshell so a stop returns to the menu
+  local kind=$1
+  shift
+  tr_select_backend "$kind"
+  tr_credentials "$kind"
+  ( trap tr_on_exit EXIT; "$@" )
+}
+
+tr_menu_reset() {
+  TR_HOST='' TR_SNAP='' TR_APP='' TR_DB='' TR_FILTER='' TR_INTO='' TR_KIND=''
+  TR_ALL=0 TR_DRY_RUN=0 TR_SCRATCH=0
+  TR_STOPPED=() TR_ASIDE_LIST=()
+}
+
+tr_menu() {
+  local choice
+  say "Thinky restore. Nothing is changed until you type yes, and the old copy is always kept."
+  while true; do
+    tr_menu_reset
+    cat >&2 <<'EOF'
+
+  1) Restore one app (for example Sonarr, or the Frigate settings)
+  2) Restore a database (the wiki, or ReadMeABook)
+  3) Rebuild a whole machine
+  4) Get back ebooks or audiobooks
+  5) Show what is in the backups
+  0) Quit
+EOF
+    ask choice "Choose a number"
+    case $choice in
+      1) tr_menu_item configs tr_cmd_app ;;
+      2) tr_menu_item configs tr_cmd_db ;;
+      3) tr_menu_item configs tr_cmd_host ;;
+      4) tr_menu_item media tr_cmd_media ;;
+      5)
+        TR_KIND=configs
+        tr_menu_item configs tr_cmd_snapshots
+        ;;
+      0 | q | quit | exit | '') return 0 ;;
+      *) say "Please type a number from the list." ;;
+    esac
+  done
+}
+
+# ===== commands: new functions go above this line =====
+
+tr_main() {
+  local sub
+  if [ $# -eq 0 ]; then
+    TR_INTERACTIVE=1
+    tr_need_root
+    if declare -F tr_menu >/dev/null; then tr_menu; else tr_usage; fi
+    return $?
+  fi
+  sub=$1
+  shift
+  case $sub in -h | --help | help) tr_usage; return 0 ;; esac
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --yes) TR_ASSUME_YES=1; shift ;;
+      --dry-run) TR_DRY_RUN=1; shift ;;
+      --scratch) TR_SCRATCH=1; shift ;;
+      --all) TR_ALL=1; shift ;;
+      --host | --snapshot | --app | --db | --filter | --into | --kind | --map | --stage | --backend | --container)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        case $1 in
+          --host) TR_HOST=$2 ;;
+          --snapshot) TR_SNAP=$2 ;;
+          --app) TR_APP=$2 ;;
+          --db) TR_DB=$2 ;;
+          --filter) TR_FILTER=$2 ;;
+          --into) TR_INTO=$2 ;;
+          --kind) TR_KIND=$2 ;;
+          --map) TR_MAPFILE=$2 ;;
+          --stage) TR_STAGE_ROOT=$2 ;;
+          --backend) TR_FORCED_BACKEND=$2 ;;
+          --container) TR_FORCED_CONTAINER=$2 ;;
+        esac
+        shift 2 ;;
+      *) die "unknown option: $1 (see --help)" ;;
+    esac
+  done
+  if declare -F "tr_cmd_$sub" >/dev/null; then
+    tr_need_root
+    "tr_cmd_$sub"
+  else
+    die "unknown command: $sub (see --help)"
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then tr_main "$@"; fi
