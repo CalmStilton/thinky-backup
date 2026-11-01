@@ -157,6 +157,259 @@ Nothing is replaced without you typing yes, and whatever was there is moved asid
 EOF
 }
 
+# ---- credentials ----------------------------------------------------------------
+tr_conf_get() {  # tr_conf_get KEY : a non-secret default from the optional conf file
+  local f=${THINKY_RESTORE_CONF:-/etc/thinky-restore.conf} line
+  [ -r "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in "$1="*) printf '%s\n' "${line#*=}"; return 0 ;; esac
+  done <"$f"
+  return 1
+}
+
+tr_show_repo() {  # print the repository without any user:password in it
+  printf '%s\n' "$RESTIC_REPOSITORY" | sed 's#//[^/@]*@#//#'
+}
+
+tr_default_repo() {  # tr_default_repo KEY : keep RESTIC_REPOSITORY, or take it from the conf file
+  local v
+  if [ -z "${RESTIC_REPOSITORY:-}" ]; then
+    v=$(tr_conf_get "$1") || return 1
+    RESTIC_REPOSITORY=$v
+  fi
+  export RESTIC_REPOSITORY
+  say "Repository: $(tr_show_repo)"
+}
+
+tr_ask_r2_repo() {
+  local ep='' bucket=''
+  ask ep "R2 S3 endpoint (card item 2)"
+  ask bucket "R2 bucket name (card item 2)"
+  [ -n "$ep" ] && [ -n "$bucket" ] || die "the endpoint and bucket name are on the break-glass card, item 2"
+  ep=${ep%/}
+  bucket=${bucket%% *}
+  RESTIC_REPOSITORY=s3:$ep/$bucket
+  export RESTIC_REPOSITORY
+  say "Repository: $(tr_show_repo)"
+}
+
+tr_offer_env_file() {  # a native host (such as AdGuard) keeps its settings in a root-only file
+  local f=${THINKY_RESTORE_ENV_FILE:-/etc/thinky-backup/env}
+  { [ -z "${RESTIC_PASSWORD:-}" ] && [ -r "$f" ]; } || return 0
+  if confirm "Found saved backup settings in $f. Use them?"; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$f"
+    set +a
+  fi
+}
+
+tr_credentials() {  # tr_credentials configs|media : fill in what restic needs. Prompts use the card's wording.
+  local kind=$1
+  if [ -n "$TR_CRED_KIND" ] && [ "$TR_CRED_KIND" != "$kind" ]; then tr_unset_creds; fi
+  TR_CRED_KIND=$kind
+  [ "$TR_BACKEND" = exec ] && return 0
+  case $kind in
+    configs)
+      tr_offer_env_file
+      tr_default_repo CONFIGS_REPOSITORY || tr_ask_r2_repo
+      ask_secret RESTIC_PASSWORD "Configs RESTIC_PASSWORD (card item 1)"
+      ask_secret AWS_ACCESS_KEY_ID "R2 Access Key ID (card item 2)"
+      ask_secret AWS_SECRET_ACCESS_KEY "R2 Secret Access Key (card item 2)"
+      TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY)
+      ;;
+    media)
+      if ! tr_default_repo MEDIA_REPOSITORY; then
+        ask RESTIC_REPOSITORY "Media repository" "rclone:gdrive:thinky-media"
+        export RESTIC_REPOSITORY
+      fi
+      ask_secret RESTIC_PASSWORD "Media RESTIC_PASSWORD (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_CLIENT_ID "Google Drive client ID (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_CLIENT_SECRET "Google Drive client secret (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_TOKEN "Google Drive token, the whole JSON (card item 3)"
+      ask_secret RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID "Google Drive folder ID (card item 3)"
+      export RCLONE_CONFIG_GDRIVE_TYPE=drive RCLONE_CONFIG_GDRIVE_SCOPE=drive.file
+      TR_DOCKER_ENV=(-e RESTIC_REPOSITORY -e RESTIC_PASSWORD
+        -e RCLONE_CONFIG_GDRIVE_TYPE -e RCLONE_CONFIG_GDRIVE_SCOPE -e RCLONE_CONFIG_GDRIVE_CLIENT_ID
+        -e RCLONE_CONFIG_GDRIVE_CLIENT_SECRET -e RCLONE_CONFIG_GDRIVE_TOKEN -e RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID)
+      ;;
+    *) die "internal error: unknown repository kind '$kind'" ;;
+  esac
+}
+
+tr_adopt_env() {  # tr_adopt_env CONTAINER VAR... : copy variables out of a running container without printing them
+  local c=$1 v val
+  shift
+  for v in "$@"; do
+    val=$(docker exec "$c" sh -c "printf %s \"\$$v\"") || die "could not read $v from $c"
+    printf -v "$v" '%s' "$val"
+    export "${v?}"
+  done
+}
+
+# ---- where restic runs ---------------------------------------------------------
+tr_container_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$1"; }
+
+tr_select_backend() {  # tr_select_backend configs|media : exec (inside a backup container), local, or image
+  local kind=$1 c list
+  TR_BACKEND=$TR_FORCED_BACKEND
+  TR_CONTAINER=$TR_FORCED_CONTAINER
+  if [ -z "$TR_BACKEND" ]; then
+    if command -v docker >/dev/null 2>&1; then
+      if [ "$kind" = media ]; then
+        list=${THINKY_RESTORE_MEDIA_CONTAINERS:-backup-media}
+      else
+        list=${THINKY_RESTORE_CONFIGS_CONTAINERS:-backup-configs backup-frigate backup-alfiecodes}
+      fi
+      for c in $list; do
+        if tr_container_running "$c"; then TR_BACKEND='exec'; TR_CONTAINER=$c; break; fi
+      done
+    fi
+    if [ -z "$TR_BACKEND" ]; then
+      if command -v restic >/dev/null 2>&1; then
+        TR_BACKEND=local
+      elif command -v docker >/dev/null 2>&1; then
+        TR_BACKEND=image
+      else
+        die "this machine has neither restic nor docker"
+      fi
+    fi
+  fi
+  case $TR_BACKEND in
+    exec)
+      [ -n "$TR_CONTAINER" ] || die "--backend exec needs --container NAME"
+      say "Using the backup container $TR_CONTAINER: nothing to type."
+      ;;
+    local | image) ;;
+    *) die "unknown backend '$TR_BACKEND' (local, exec or image)" ;;
+  esac
+}
+
+tr_restic() {
+  case $TR_BACKEND in
+    local) restic "$@" ;;
+    exec) docker exec "$TR_CONTAINER" restic "$@" ;;
+    image)
+      if [ -n "$TR_STAGE_HOST" ]; then
+        docker run --rm --security-opt apparmor=unconfined --entrypoint restic \
+          ${TR_DOCKER_ENV[@]+"${TR_DOCKER_ENV[@]}"} -v "$TR_STAGE_HOST:$TR_STAGE_MOUNT" "$TR_IMAGE" "$@"
+      else
+        docker run --rm --security-opt apparmor=unconfined --entrypoint restic \
+          ${TR_DOCKER_ENV[@]+"${TR_DOCKER_ENV[@]}"} "$TR_IMAGE" "$@"
+      fi
+      ;;
+    *) die "internal error: no backend selected" ;;
+  esac
+}
+
+tr_open_stage() {  # makes a private staging folder; sets TR_STAGE_HOST (where we see it) and TR_STAGE_ARG (where restic sees it)
+  local id src base
+  id=thinky-restore-$(date +%Y%m%d-%H%M%S)-$$
+  case $TR_BACKEND in
+    exec)
+      src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/scratch"}}{{.Source}}{{end}}{{end}}' "$TR_CONTAINER") ||
+        die "cannot inspect $TR_CONTAINER"
+      [ -n "$src" ] || die "$TR_CONTAINER has no /scratch volume; use --backend image instead"
+      TR_STAGE_HOST=$src/$id
+      TR_STAGE_ARG=/scratch/$id
+      ;;
+    *)
+      base=${TR_STAGE_ROOT:-$TR_ROOT/var/tmp}
+      TR_STAGE_HOST=$base/$id
+      TR_STAGE_ARG=$TR_STAGE_HOST
+      if [ "$TR_BACKEND" = image ]; then TR_STAGE_ARG=$TR_STAGE_MOUNT; fi
+      ;;
+  esac
+  (umask 077 && mkdir -p -- "$TR_STAGE_HOST") || die "cannot create $TR_STAGE_HOST"
+  TR_CLEANUP_DIRS+=("$TR_STAGE_HOST")
+}
+
+tr_close_stage() { tr_cleanup_stage; }
+
+tr_restore() {  # tr_restore SNAPSHOT_ID PATH... : fetch just these paths into the stage
+  local snap=$1 a=() p
+  shift
+  for p in "$@"; do a+=(--include "$p"); done
+  tr_restic restore "$snap" --target "$TR_STAGE_ARG" "${a[@]}" >/dev/null || die "restic could not restore from snapshot $snap"
+}
+
+# ---- looking at the backups -----------------------------------------------------
+tr_table() {  # tr_table TAG [HOST] -> lines: ID<TAB>YYYY-MM-DD HH:MM:SS<TAB>host<TAB>size, oldest first
+  local out args=(snapshots --compact --tag "$1")
+  [ -n "${2:-}" ] && args+=(--host "$2")
+  out=$(tr_restic "${args[@]}" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+  printf '%s\n' "$out" | awk '$1 ~ /^[0-9a-f]+$/ && $2 ~ /^[0-9][0-9][0-9][0-9]-/ {
+    s = ""; if (NF >= 7) s = $6 " " $7
+    printf "%s\t%s %s\t%s\t%s\n", $1, $2, $3, $4, s }'
+}
+
+tr_hosts() { tr_table "$1" | awk -F'\t' '{ print $3 }' | sort -u; }
+
+tr_pick_host() {  # tr_pick_host TAG : in the menu, ask which machine
+  local hosts=() h list
+  [ -n "$TR_HOST" ] && return 0
+  [ "$TR_INTERACTIVE" = 1 ] || return 0
+  list=$(tr_hosts "$1") || exit 1
+  while IFS= read -r h; do [ -n "$h" ] && hosts+=("$h"); done <<<"$list"
+  [ "${#hosts[@]}" -gt 0 ] || die "no backups found in this repository"
+  tr_choose TR_HOST "Which machine?" "${hosts[@]}"
+}
+
+tr_resolve_snapshot() {  # tr_resolve_snapshot TAG : sets TR_SNAP_ID and TR_SNAP_WHEN from --snapshot (default latest)
+  local want=${TR_SNAP:-latest} list line rest
+  list=$(tr_table "$1" "$TR_HOST") || exit 1
+  [ -n "$list" ] || die "no '$1' snapshots found for host '$TR_HOST' (option 5 lists what exists)"
+  if [ "$want" = latest ]; then
+    line=$(printf '%s\n' "$list" | tail -n 1)
+  else
+    line=$(printf '%s\n' "$list" | awk -F'\t' -v w="$want" 'index($1, w) == 1 { print; exit }')
+  fi
+  [ -n "$line" ] || die "snapshot '$want' not found for host '$TR_HOST'"
+  TR_SNAP_ID=${line%%$'\t'*}
+  rest=${line#*$'\t'}
+  TR_SNAP_WHEN=${rest%%$'\t'*}
+}
+
+tr_pick_snapshot() {  # tr_pick_snapshot TAG : in the menu offer the recent snapshots, otherwise use --snapshot or the newest
+  local list line items=() choice
+  if [ -z "$TR_SNAP" ] && [ "$TR_INTERACTIVE" = 1 ]; then
+    list=$(tr_table "$1" "$TR_HOST") || exit 1
+    [ -n "$list" ] || die "no '$1' snapshots found for host '$TR_HOST'"
+    while IFS= read -r line; do
+      items=("$(printf '%s' "$line" | awk -F'\t' '{ printf "%s  %s  %s", $1, $2, $4 }')" ${items[@]+"${items[@]}"})
+    done <<<"$list"
+    say "Which backup? The newest is first."
+    TR_CHOOSE_DEFAULT=1 tr_choose choice "Enter a number" "${items[@]:0:15}"
+    TR_SNAP=${choice%% *}
+  fi
+  tr_resolve_snapshot "$1"
+}
+
+tr_children() {  # tr_children SNAPSHOT DIR -> names of the entries directly inside DIR
+  tr_restic ls "$1" "$2" 2>/dev/null | awk -v d="$2" '
+    index($0, d "/") == 1 { n = substr($0, length(d) + 2); if (n != "" && index(n, "/") == 0) print n }'
+}
+
+tr_cmd_snapshots() {
+  local kind=${TR_KIND:-configs} hosts h
+  tr_select_backend "$kind"
+  tr_credentials "$kind"
+  if [ -n "$TR_HOST" ]; then hosts=$TR_HOST; else hosts=$(tr_hosts "$kind") || exit 1; fi
+  [ -n "$hosts" ] || die "no '$kind' backups found"
+  while IFS= read -r h; do
+    say "Machine: $h"
+    TR_HOST=$h
+    tr_table "$kind" "$h" | while IFS=$'\t' read -r id when _ size; do
+      printf '  %s  %s  %s\n' "$id" "$when" "$size"
+    done
+    if [ -n "$TR_FILTER" ]; then
+      tr_resolve_snapshot "$kind"
+      say "  Files matching '$TR_FILTER' in the newest backup ($TR_SNAP_ID):"
+      tr_restic ls "$TR_SNAP_ID" 2>/dev/null | grep -iF -- "$TR_FILTER" | head -n 50 | sed 's/^/    /'
+    fi
+  done <<<"$hosts"
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
