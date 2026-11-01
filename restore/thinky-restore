@@ -974,6 +974,51 @@ tr_cmd_media() {
   say "To add a book back to Calibre use Add books; for audiobooks copy the folder into the audiobooks share."
 }
 
+# ---- the menu ------------------------------------------------------------------------------
+tr_menu_item() {  # tr_menu_item KIND COMMAND : ask for the passwords here (so they are kept), then run in a subshell so a stop returns to the menu
+  local kind=$1
+  shift
+  tr_select_backend "$kind"
+  tr_credentials "$kind"
+  ( trap tr_on_exit EXIT; "$@" )
+}
+
+tr_menu_reset() {
+  TR_HOST='' TR_SNAP='' TR_APP='' TR_DB='' TR_FILTER='' TR_INTO='' TR_KIND=''
+  TR_ALL=0 TR_DRY_RUN=0 TR_SCRATCH=0
+  TR_STOPPED=() TR_ASIDE_LIST=()
+}
+
+tr_menu() {
+  local choice
+  say "Thinky restore. Nothing is changed until you type yes, and the old copy is always kept."
+  while true; do
+    tr_menu_reset
+    cat >&2 <<'EOF'
+
+  1) Restore one app (for example Sonarr, or the Frigate settings)
+  2) Restore a database (the wiki, or ReadMeABook)
+  3) Rebuild a whole machine
+  4) Get back ebooks or audiobooks
+  5) Show what is in the backups
+  0) Quit
+EOF
+    ask choice "Choose a number"
+    case $choice in
+      1) tr_menu_item configs tr_cmd_app ;;
+      2) tr_menu_item configs tr_cmd_db ;;
+      3) tr_menu_item configs tr_cmd_host ;;
+      4) tr_menu_item media tr_cmd_media ;;
+      5)
+        TR_KIND=configs
+        tr_menu_item configs tr_cmd_snapshots
+        ;;
+      0 | q | quit | exit | '') return 0 ;;
+      *) say "Please type a number from the list." ;;
+    esac
+  done
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
