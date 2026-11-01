@@ -43,3 +43,9 @@ def test_the_tool_holds_no_site_specific_values():
     text = SCRIPT.read_text().lower()
     for word in ("lukmor", "192.168", "daa7be88", "thinky-configs", "cloudflarestorage"):
         assert word not in text, word
+
+
+@pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck not installed")
+def test_shellcheck_is_clean():
+    r = subprocess.run(["shellcheck", "-x", str(SCRIPT)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
