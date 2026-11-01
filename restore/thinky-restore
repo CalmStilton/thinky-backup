@@ -768,6 +768,118 @@ tr_cmd_db() {
   tr_close_stage
 }
 
+# ---- option 3: rebuild a whole machine ---------------------------------------------------
+tr_ls_a() { ls -A -- "$1" 2>/dev/null; }
+
+tr_stage_units() {  # snapshot paths of everything in the stage that can be put back; unmapped /src/* are reported on stderr
+  local n top sub k covered
+  if [ -d "$TR_STAGE_HOST/src/opt" ]; then
+    while IFS= read -r n; do printf '/src/opt/%s\n' "$n"; done < <(tr_ls_a "$TR_STAGE_HOST/src/opt")
+  fi
+  if [ -d "$TR_STAGE_HOST/src/vol" ]; then
+    while IFS= read -r n; do printf '/src/vol/%s\n' "$n"; done < <(tr_ls_a "$TR_STAGE_HOST/src/vol")
+  fi
+  for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+    if [ -e "$TR_STAGE_HOST$k" ]; then printf '%s\n' "$k"; fi
+  done
+  if [ -d "$TR_STAGE_HOST/src" ]; then
+    while IFS= read -r top; do
+      case $top in opt | vol) continue ;; esac
+      covered=0
+      for k in ${TR_MAP_SRC[@]+"${TR_MAP_SRC[@]}"}; do
+        case $k in "/src/$top" | "/src/$top"/*) covered=1 ;; esac
+      done
+      if [ "$covered" = 0 ]; then echo "UNMAPPED /src/$top" >&2; fi
+    done < <(tr_ls_a "$TR_STAGE_HOST/src")
+  fi
+  while IFS= read -r top; do   # a native host: real paths, two levels down (for example /opt/AdGuardHome)
+    case $top in src | scratch) continue ;; esac
+    while IFS= read -r sub; do printf '/%s/%s\n' "$top" "$sub"; done < <(tr_ls_a "$TR_STAGE_HOST/$top")
+  done < <(tr_ls_a "$TR_STAGE_HOST")
+}
+
+tr_collect_units() {  # fills the global array TR_UNITS from the stage
+  local u
+  TR_UNITS=()
+  while IFS= read -r -u 3 u; do   # fd 3, so the prompt below still reads the keyboard
+    case $u in
+      UNMAPPED*)
+        if tr_ask_unmapped "${u#UNMAPPED }"; then
+          TR_UNITS+=("${u#UNMAPPED }")
+        else
+          warn "${u#UNMAPPED } has no known live path and will be left in the staging folder (see --map)"
+          TR_KEEP_STAGE=1
+        fi
+        ;;
+      *) TR_UNITS+=("$u") ;;
+    esac
+  done 3< <(tr_stage_units 2>&1)
+}
+
+tr_place_all() {  # put every unit in TR_UNITS back, then the SQLite copies
+  local u placed=0
+  for u in "${TR_UNITS[@]}"; do
+    if tr_place_unit "$u"; then placed=$((placed + 1)); say "  restored $u"; else TR_KEEP_STAGE=1; fi
+  done
+  tr_overlay_sqlite ""
+  say "Put back $placed item(s) and $TR_OVERLAID database cop(ies)."
+}
+
+tr_cmd_host() {
+  local u real live note portainer_image
+  TR_KEEP_STAGE=0
+  tr_load_default_map
+  tr_select_backend configs
+  tr_credentials configs
+  tr_pick_host configs
+  tr_need TR_HOST "Which machine's backup (host name)"
+  tr_pick_snapshot configs
+
+  tr_open_stage
+  say "Fetching everything for $TR_HOST from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) into $TR_STAGE_HOST"
+  say "Free space there: $(df -h -- "${TR_STAGE_HOST%/*}" | awk 'NR == 2 { print $4 }'). Use --stage DIR to stage on a bigger disk."
+  tr_restic restore "$TR_SNAP_ID" --target "$TR_STAGE_ARG" >/dev/null || die "restic could not restore snapshot $TR_SNAP_ID"
+  tr_collect_units
+  [ "${#TR_UNITS[@]}" -gt 0 ] || die "that snapshot holds nothing this tool knows how to put back"
+
+  say ""
+  say "This will put the following on THIS machine ($(hostname)):"
+  for u in "${TR_UNITS[@]}"; do
+    real=$(tr_live_for "$u") || continue
+    live=$TR_ROOT$real
+    note="new"
+    if [ -e "$live" ] && [ -n "$(ls -A -- "$live" 2>/dev/null || echo file)" ]; then note="exists, will be moved aside"; fi
+    say "  $u -> $live ($note)"
+  done
+  if [ "$TR_DRY_RUN" = 1 ]; then
+    say "Dry run: nothing on this machine was changed."
+    tr_close_stage
+    return 0
+  fi
+  confirm "Restore all of this from snapshot $TR_SNAP_ID ($TR_SNAP_WHEN) onto this machine?" ||
+    { tr_close_stage; die "not confirmed; nothing was changed"; }
+
+  tr_place_all
+  if printf '%s\n' "${TR_UNITS[@]}" | grep -Fxq /src/vol/portainer_data && command -v docker >/dev/null 2>&1; then
+    portainer_image=${THINKY_RESTORE_PORTAINER_IMAGE:-portainer/portainer-ce:lts}
+    if confirm "Start Portainer now from the restored data ($portainer_image)?"; then
+      docker run -d --name portainer --restart=always -p 9000:9000 -p 9443:9443 \
+        -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data "$portainer_image" >/dev/null ||
+        warn "could not start Portainer (is one already running?)"
+    fi
+    say ""
+    say "Next: open Portainer on port 9000, go to Stacks, and start each stack. The stack numbers saved are:"
+    say "  $(tr_ls_a "$TR_ROOT/var/lib/docker/volumes/portainer_data/_data/compose" | tr '\n' ' ')"
+    say "Once the stacks are up, run this tool again and choose option 2 for BookStack and for ReadMeABook."
+  fi
+  if [ "$TR_KEEP_STAGE" = 1 ]; then
+    TR_CLEANUP_DIRS=()
+    say "Some items were not put back. They are still in $TR_STAGE_HOST (delete it when you are finished)."
+  else
+    tr_close_stage
+  fi
+}
+
 # ===== commands: new functions go above this line =====
 
 tr_main() {
