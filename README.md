@@ -47,6 +47,7 @@ the table below lists every variable it reads, with its default and meaning.
 | `DRILL_MARIADB_TABLE` | `entities` | table whose row count the MariaDB drill reports; plain names only |
 | `DRILL_SQLITE_FILE` | empty | path inside the snapshot of a SQLite database to integrity-check |
 | `DRILL_PGDUMP_FILE` | empty | path inside the snapshot of a PostgreSQL custom-format dump to list |
+| `DRILL_RESTORE_APP` | empty | an app such as `opt/prowlarr`: the drill runs `thinky-restore app --dry-run` for it against the real repository; a failure is a drill failure |
 
 The native script (below) reads its own variables: `CONF_DIR` (default `/etc/thinky-backup`),
 `FORGET_ARGS` (same default as above), `KUMA_PUSH_BACKUP`, and the four restic and host

@@ -106,19 +106,38 @@ def check_mariadb(dump_gz: str, table: str, workdir: str, timeout: float = 60) -
             server.kill()
 
 
+RESTORE_TOOL_TIMEOUT = 900
+
+
+def check_restore_tool(cfg: Config, env: dict[str, str], stage: str, tool: str | None = None) -> list[str]:
+    """Dry-run `thinky-restore app` against the real repository, so the tool and the snapshot layout stay in step."""
+    tool = tool or os.environ.get("THINKY_RESTORE_BIN") or "thinky-restore"
+    cmd = [tool, "app", "--host", cfg.host, "--app", cfg.drill_restore_app, "--dry-run", "--stage", stage]
+    try:
+        out = subprocess.run(cmd, env={**os.environ, **env, "TR_BACKEND": "local"}, capture_output=True, text=True,
+                             timeout=RESTORE_TOOL_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"restore tool: {exc}"]
+    if out.returncode != 0:
+        lines = out.stderr.strip().splitlines()
+        return [f"restore tool: dry run of {cfg.drill_restore_app} failed: {(lines[-1] if lines else 'no message')[:200]}"]
+    return []
+
+
 def drill(cfg: Config, restic: Restic, push=None) -> int:
     targets = [f for f in (cfg.drill_mariadb_file, cfg.drill_sqlite_file, cfg.drill_pgdump_file) if f]
-    if not targets:
-        raise ConfigError("drill: set at least one of DRILL_MARIADB_FILE, DRILL_SQLITE_FILE, DRILL_PGDUMP_FILE")
+    if not targets and not cfg.drill_restore_app:
+        raise ConfigError("drill: set at least one of DRILL_MARIADB_FILE, DRILL_SQLITE_FILE, DRILL_PGDUMP_FILE, "
+                          "DRILL_RESTORE_APP")
     problems: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         args = ["restore", "latest", "--host", cfg.host, "--tag", cfg.tag, "--target", tmp]
         for target in targets:
             args += ["--include", target]
-        rc = restic.run(*args).returncode
+        rc = restic.run(*args).returncode if targets else 0
         if rc != 0:
             problems.append(f"restic restore failed (exit {rc})")
-        else:
+        elif targets:
             def restored(p: str) -> str:
                 return os.path.join(tmp, p.lstrip("/"))
             checks = []
@@ -134,4 +153,8 @@ def drill(cfg: Config, restic: Restic, push=None) -> int:
                     problems += check()
                 except (OSError, EOFError, subprocess.SubprocessError, ValueError) as exc:
                     problems.append(f"{kind}: {exc}")
+        if cfg.drill_restore_app:
+            stage = os.path.join(tmp, "_restore_tool")
+            os.makedirs(stage)
+            problems += check_restore_tool(cfg, restic.env, stage)
     return jobs.finish(cfg.push_drill, f"{cfg.host}/{cfg.tag} drill", problems, push)

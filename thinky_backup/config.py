@@ -68,6 +68,7 @@ class Config:
     drill_mariadb_table: str
     drill_sqlite_file: str
     drill_pgdump_file: str
+    drill_restore_app: str
 
 
 def load(env: dict[str, str] | None = None) -> Config:
@@ -89,6 +90,9 @@ def load(env: dict[str, str] | None = None) -> Config:
     table = env.get("DRILL_MARIADB_TABLE") or "entities"
     if not re.fullmatch(r"[A-Za-z0-9_]+", table):
         raise ConfigError(f"DRILL_MARIADB_TABLE: not a plain table name: {table!r}")
+    restore_app = env.get("DRILL_RESTORE_APP", "")
+    if restore_app and not re.fullmatch(r"[A-Za-z0-9._/-]+", restore_app) or ".." in restore_app:
+        raise ConfigError(f"DRILL_RESTORE_APP: not a plain app name such as opt/prowlarr: {restore_app!r}")
     return Config(
         host=env["BACKUP_HOST"],
         tag=env["BACKUP_TAG"],
@@ -112,4 +116,5 @@ def load(env: dict[str, str] | None = None) -> Config:
         drill_mariadb_table=table,
         drill_sqlite_file=env.get("DRILL_SQLITE_FILE", ""),
         drill_pgdump_file=env.get("DRILL_PGDUMP_FILE", ""),
+        drill_restore_app=restore_app,
     )
