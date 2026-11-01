@@ -28,7 +28,7 @@ the table below lists every variable it reads, with its default and meaning.
 | `BACKUP_HOST` | required | host label stored on snapshots (`--host`) |
 | `BACKUP_TAG` | required | tag stored on snapshots (`--tag`) |
 | `BACKUP_SOURCES` | empty | newline-separated paths to back up; `#` starts a comment line. Required by `backup`. |
-| `BACKUP_EXCLUDES` | empty | newline-separated restic exclude patterns (literal paths work too) |
+| `BACKUP_EXCLUDES` | empty | newline-separated exclude patterns. A single name or glob (`logs`, `*.log`) matches a file or folder name anywhere. An absolute path (`/src/opt/app/cache`) excludes that path and everything under it. Nothing else is accepted: a relative pattern containing `/`, or a wildcard in an absolute path, is a configuration error. |
 | `FORGET_ARGS` | `--keep-daily 7 --keep-weekly 4 --keep-monthly 6` | retention flags passed to `restic forget` |
 | `SQLITE_SCAN` | `true` | find SQLite databases in `BACKUP_SOURCES` and back up consistent copies instead of the live files |
 | `SCRATCH_DIR` | `/scratch` | working directory for SQLite copies and the generated exclude file |
@@ -53,6 +53,19 @@ The native script (below) reads its own variables: `CONF_DIR` (default `/etc/thi
 variables. It takes its paths from `$CONF_DIR/sources.txt` and, optionally,
 `$CONF_DIR/excludes.txt`.
 
+## Second repository
+
+`RESTIC_REPOSITORY2` is optional. `thinky-backup init` only initialises the primary repository.
+Initialise the second one once, by hand, with the same password settings the job will use:
+
+```sh
+RESTIC_REPOSITORY=<repo2> RESTIC_PASSWORD=<pw2> \
+  RESTIC_FROM_REPOSITORY=<repo1> RESTIC_FROM_PASSWORD=<pw1> \
+  restic init --copy-chunker-params
+```
+
+`check` only checks the primary repository. The second repository is not checked by any job.
+
 ## How SQLite is backed up
 
 Opening a live WAL database on a read-only mount fails, because SQLite must write the `-shm`
@@ -62,6 +75,11 @@ temp directory, the copy is opened there (SQLite replays the WAL), integrity-che
 written out as one clean file with the SQLite backup API. A copy torn by a concurrent write
 fails the integrity check and is retried. The clean copies are backed up in place of the live
 files, which are excluded.
+
+Snapshotted databases are stored in the snapshot at `/scratch/sqlite/<original absolute path>`
+(the default `SCRATCH_DIR`). The live file is not in the snapshot. So `DRILL_SQLITE_FILE` and
+`restic restore --include` must use the `/scratch/sqlite/...` path. For example,
+`/src/opt/app/app.db` is stored as `/scratch/sqlite/src/opt/app/app.db`.
 
 ## Exit codes
 
@@ -79,7 +97,9 @@ the traceback.
 `native/thinky-backup-native.sh` runs `restic backup --files-from $CONF_DIR/sources.txt`, then
 `restic forget --prune`, then pushes to `KUMA_PUSH_BACKUP`. It does not copy SQLite databases;
 use the container for those. `native/thinky-backup.service` and `native/thinky-backup.timer`
-run it nightly. Put the variables in `/etc/thinky-backup/env` (the unit's `EnvironmentFile`),
+run it nightly. A missing required variable exits before any Kuma push, so no result arrives;
+the monitor's heartbeat interval is what catches it. A missing restic binary is reported as a
+failed backup, so Kuma gets a down push. Put the variables in `/etc/thinky-backup/env` (the unit's `EnvironmentFile`),
 install the script as `/usr/local/bin/thinky-backup-native`, and override the timer's
 `OnCalendar` with a drop-in for each host's schedule.
 

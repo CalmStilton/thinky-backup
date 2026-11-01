@@ -66,3 +66,16 @@ def test_repository2_needs_password2():
 def test_table_name_is_validated():
     with pytest.raises(config.ConfigError, match="DRILL_MARIADB_TABLE"):
         config.load(dict(BASE, DRILL_MARIADB_TABLE="entities; DROP"))
+
+
+@pytest.mark.parametrize("pattern", ["/data/*/tmp.db", "cache/*.db"])
+def test_excludes_the_sqlite_scan_cannot_honour_are_rejected(pattern):
+    with pytest.raises(config.ConfigError, match="BACKUP_EXCLUDES"):
+        config.load(dict(BASE, BACKUP_EXCLUDES=pattern))
+
+
+@pytest.mark.parametrize("pattern", [
+    "logs", "*.log", "/src/opt/calibre/config/Calibre Library", "MediaCover",
+])
+def test_excludes_the_sqlite_scan_honours_are_accepted(pattern):
+    assert config.load(dict(BASE, BACKUP_EXCLUDES=pattern)).excludes == [pattern]

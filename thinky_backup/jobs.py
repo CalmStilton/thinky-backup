@@ -67,7 +67,7 @@ def backup(cfg: Config, restic: Restic, push=None) -> int:
         problems.append(f"restic forget failed (exit {rc})")
 
     if cfg.repository2:
-        # Clear RESTIC_REPOSITORY2/PASSWORD2: restic rejects them alongside --from-repo.
+        # RESTIC_REPOSITORY2/PASSWORD2 are blanked so the child process doesn't carry repo-2 secrets it doesn't need.
         second = {"RESTIC_REPOSITORY": cfg.repository2, "RESTIC_PASSWORD": cfg.password2,
                   "RESTIC_REPOSITORY2": "", "RESTIC_PASSWORD2": "",
                   "RESTIC_FROM_REPOSITORY": restic.env["RESTIC_REPOSITORY"],

@@ -22,6 +22,17 @@ def _lines(value: str | None) -> list[str]:
     return out
 
 
+def _check_exclude(pattern: str) -> None:
+    """Reject patterns the SQLite scan (fnmatch on paths) cannot match the way restic does."""
+    if pattern.startswith("/"):
+        if any(c in pattern for c in "*?["):
+            raise ConfigError(
+                f"BACKUP_EXCLUDES: absolute patterns must be plain path prefixes (no wildcards): {pattern!r}")
+    elif "/" in pattern:
+        raise ConfigError(
+            f"BACKUP_EXCLUDES: relative patterns must be a single name or glob without '/': {pattern!r}")
+
+
 def _bool(name: str, value: str | None, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
@@ -72,6 +83,9 @@ def load(env: dict[str, str] | None = None) -> Config:
     password2 = env.get("RESTIC_PASSWORD2", "")
     if repository2 and not password2:
         raise ConfigError("RESTIC_PASSWORD2 is required when RESTIC_REPOSITORY2 is set")
+    excludes = _lines(env.get("BACKUP_EXCLUDES"))
+    for pattern in excludes:
+        _check_exclude(pattern)
     table = env.get("DRILL_MARIADB_TABLE") or "entities"
     if not re.fullmatch(r"[A-Za-z0-9_]+", table):
         raise ConfigError(f"DRILL_MARIADB_TABLE: not a plain table name: {table!r}")
@@ -79,7 +93,7 @@ def load(env: dict[str, str] | None = None) -> Config:
         host=env["BACKUP_HOST"],
         tag=env["BACKUP_TAG"],
         sources=_lines(env.get("BACKUP_SOURCES")),
-        excludes=_lines(env.get("BACKUP_EXCLUDES")),
+        excludes=excludes,
         forget_args=shlex.split(env.get("FORGET_ARGS") or DEFAULT_FORGET),
         sqlite_scan=_bool("SQLITE_SCAN", env.get("SQLITE_SCAN"), True),
         scratch=env.get("SCRATCH_DIR") or "/scratch",

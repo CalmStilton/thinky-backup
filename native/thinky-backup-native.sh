@@ -17,7 +17,7 @@ excludes=()
 if [ -f "$CONF_DIR/excludes.txt" ]; then excludes=(--exclude-file "$CONF_DIR/excludes.txt"); fi
 
 restic --retry-lock 30m backup --host "$BACKUP_HOST" --tag "$BACKUP_TAG" \
-  --files-from "$CONF_DIR/sources.txt" "${excludes[@]}"
+  --files-from "$CONF_DIR/sources.txt" ${excludes[@]+"${excludes[@]}"}
 rc=$?
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then push down "$job: restic backup failed (exit $rc)"; exit 1; fi
 
